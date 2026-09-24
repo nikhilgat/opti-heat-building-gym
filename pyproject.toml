@@ -6,9 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "llec-building-gym"
 version = "0.1.1"
 description = "A Gymnasium-compatible environment for controlling building heating systems based on KIT's LLEC."
-authors = [
-    { name = "Gökhan Demirel", email = "goekhan.demirel@kit.edu" }
-]
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"

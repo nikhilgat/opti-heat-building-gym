@@ -1,278 +1,263 @@
-<p float="left">
-    <img src="data/img/icon_kit.png" width="10%" hspace="20"/>
-</p>
+# Opti-Heat Building Gym
 
-[![Python](https://img.shields.io/badge/Python-3.9.18-blue?logo=python)](https://www.python.org/downloads/release/python-3918/)
-[![License](https://img.shields.io/badge/License-MIT-green?logo=opensource)](./LICENSE)
-[![Code Style](https://img.shields.io/badge/Code%20Style-black-000000.svg?logo=python)](https://github.com/psf/black)
-[![DOI](https://img.shields.io/badge/DOI-10.1109%2FISGTEurope64741.2025.11305332-orange?logo=doi)](https://doi.org/10.1109/ISGTEurope64741.2025.11305332)
+Reinforcement-learning vs. classical control of a **real residential heat pump** — a single-family building in **Langenhagen (Hannover), Germany**, heated by an **IDM AERO ALM 4-12** air-source heat pump.
 
+This project started as a fork of KIT's [LLECBuildingGym](https://github.com/KIT-IAI/LLECBuildingGym) (the code behind the paper *"Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings"*). That repo simulates a small *toy* building with a fixed-efficiency heat pump and weather from KIT Karlsruhe. We retrofitted it so the simulation describes **our** building: real thermal parameters, the real heat pump's datasheet, and a full year of real local weather and electricity prices. Then we retrained the RL agents and re-ran the whole controller benchmark.
 
-<p float="left">
-    <img src="data/img/icon_llecbuildinggym.svg" width="40%" hspace="30"/>
-</p>
+> **Status (Sept 2026):** real-building model complete and validated. Latest benchmark: **SAC is the best controller** (reward 100.54), ahead of MPC (69.26), PPO (63.72) and Fuzzy (62.94). PI/PID are not yet retuned for this building. See [Where we are now](#6-where-we-are-now).
 
-<h1 align="center">Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings</h1>
+---
 
+## 1. What is being simulated
 
-<div align="center">
-    <img src="data/img/HeatPumpEnvironment.gif" style="width:44%;">
-</div>
+Every 5 minutes a controller decides how hard to run the heat pump. The simulation then advances the building's indoor temperature and charges the electricity cost for that 5-minute slot. One **episode is one day** (288 steps).
 
-
-**⚠️ Note**: _Last update on 05.01.2026_
-
-<div align="left"> 
-This repository contains the official code of our paper <strong>"Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings"</strong>.
-It features a custom <a href="https://github.com/Farama-Foundation/Gymnasium" target="_blank"><strong>Gymnasium</strong></a> environment for smart heat pump control in residential buildings, inspired by the Heat Pump House at the  
-<a href="https://www.iai.kit.edu/english/RPE-LLEC.php" target="_blank"><strong>Living Lab Energy Campus (LLEC)</strong></a>, KIT.
-</div>
-
-## 1. Introduction LLECBuildingGym
-
-<details>
-  <summary>Click to expand/collapse</summary>
-
-### 1.1 Description
-
-The **[base_building_gym.py](llec_building_gym/envs/base_building_gym.py)** simulates thermal building dynamics with heat pump control in 5-minute intervals.
-This framework leverages the **[Gymnasium](https://github.com/Farama-Foundation/Gymnasium)** and **[Pyomo](https://github.com/Pyomo/pyomo)** libraries, making it suitable for both reinforcement learning agents and advanced control strategies.
-
-To simulate real-world uncertainty, the environment includes:
-
-- **Wiener Process Noise** introduces random fluctuations into the outdoor temperature
-- **Sensor Noise** simulates inaccurate indoor and outdoor temperature measurements
-
-These features support the evaluation under uncertainty and help assess the robustness of control strategies.
-
-#### Key Features
-
-- Single-zone indoor thermal model with electric heat pump control and heat loss dynamics
-- Dynamic energy pricing and weather inputs
-- Configurable heat pump control every 5 minutes
-- Exogenous variables outdoor temperature and dynamic energy prices
-- Modular design supporting custom reward modes and controllers (RL, PI, PID, Fuzzy, MPC)
-
-### 1.2 Project Structure
-
-```bash
-LLECBuildingGym/                              # Root directory of the project
-├── data/                                     # Input data (e.g., weather, pricing)
-├── llec_building_gym/                        # Main Python package: Gym environment and controllers
-│   ├── controllers/                          # Other controllers; Fuzzy, MPC, PI, PID
-│   │   ├── __init__.py                       # Exports controller classes
-│   │   ├── fuzzy_controller.py               # Fuzzy controller
-│   │   ├── mpc_controller.py                 # MPC controller
-│   │   ├── pi_controller.py                  # PI controller
-│   │   ├── pid_controller.py                 # PID controller
-│   │   └── README_MPC.md                     # MPC documentation and usage instructions
-│   ├── envs/                                 # Submodule with environment definitions
-│   │   ├── __init__.py                       # Exports environments for external use
-│   │   └── base_building_gym.py              # Main environment logic and control integration
-│   └── __init__.py                           # Registers environments
-├── models/                                   # Saved trained models (PPO, SAC, DDPG,TD3, A2C)
-├── plot-paper/                               # Notebooks to generate figures and tables
-│   ├── check_envs_registration.ipynb         # Verifies registered Gymnasium environments
-│   ├── generate_table03_summary_stats.ipynb  # Generate Table 03
-│   ├── plot_fig03_temperature_data.ipynb     # Plots indoor/outdoor temperature data for Figure 03
-│   ├── plot_fig04_price_data.ipynb           # Plots dynamic energy prices for Figure 04
-│   ├── plot_fig05_indoor_temp_setpoint.ipynb # Plots dynamic indoor temp setpoints for Figure 05
-│   └── preprocess_outdoor_temperature.ipynb  # Prepares outdoor temperature time series
-├── slurm_logs_eval/                          # SLURM logs from evaluation jobs
-├── slurm_logs_train/                         # SLURM logs from training jobs
-├── slurm_script/                             # SLURM job submission scripts
-├── results/                                  # Evaluation logs and result CSVs
-├── .gitignore                                # Ignore in version control
-├── LICENSE                                   # Licensing
-├── README.md                                 # Repo documentation and usage instructions
-├── pyproject.toml                            # Build system configuration
-├── requirements.txt                          # Python dependencies
-├── run_evaluation.py                         # Evaluate trained models
-└── run_train_rl.py                           # Train RL models (PPO, SAC, DDPG,TD3, A2C)
+```
+ outdoor temp (Langenhagen 2025) ─┐
+ electricity price (Tibber 2025) ─┤
+                                  ▼
+ controller ──action∈[-1,1]──►  heat pump (IDM ALM 4-12, 2D COP model)
+    ▲                             │ heat Q_HP = action · Q_HP_Max
+    │                             ▼
+    └──── observation ◄──── building (1R1C thermal model) ──► reward = comfort − cost
 ```
 
-</details>
+- **Action** `a ∈ [-1, 1]`: fraction of maximum heat-pump power. Positive means heating, negative means cooling.
+- **Controllers compared:** SAC and PPO (RL, Stable-Baselines3), PI, PID, Fuzzy logic, and MPC (Pyomo + IPOPT).
 
-## 2. Installation and Environment Setup
+---
 
-<details>
-  <summary>Click to expand/collapse</summary>
+## 2. The building
 
-### 2.1a Haicore (Linux):
+### 2.1 Thermal model (1R1C)
 
-Clone the repository:
-```bash
-git clone https://github.com/KIT-IAI/LLECBuildingGym
-python3.9 -m venv llec_env
-source llec_env/bin/activate
-cd LLECBuildingGym
+The house is modelled as one thermal mass `mC` that loses heat to the outside through a conductance `K`:
 
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install -e .
+```
+mC · dT_in/dt = −K · (T_in − T_out) + Q_HP
 ```
 
-The virtual environment and project directory should be organized as shown below:
-```bash
-llec_env/        # Python virtual environment
-LLECBuildingGym/ # Root directory of the project
+| Parameter | Value | Meaning |
+|---|---|---|
+| `mC` | **74,600,000 J/K** | thermal capacitance of the building |
+| `K` | **366 W/K** | overall heat-loss coefficient (UA) |
+| `Q_HP_Max` | **12,000 W** | max heat output, the top of the IDM ALM 4-12 range |
+| Room setpoint (MPC reference) | **20.2 °C** | |
+| Thermal time constant `τ = mC/K` | **≈ 56.6 h** | how slowly the house cools with the heat pump off |
+
+By comparison, the original toy building used `mC=300, K=20, Q_HP_Max=1500`.
+
+**Validated.** `validate_dynamics.py` switches the heat pump off, simulates 48 h, fits the exponential cool-down and compares it to theory:
+
+| Expected τ | Fitted τ | Error |
+|---|---|---|
+| 56.62 h | 56.58 h | **0.074 % ✔** |
+
+This check also confirmed the key physics fix: the original code had a hidden `dt_scale = 1e-3` factor that made the building's time constant 1000× too long. With real SI values you must use `--dt-scale 1.0`.
+
+### 2.2 Heat pump: IDM AERO ALM 4-12
+
+The original repo used one fixed efficiency (COP) for every hour of the year. We replaced it with a model of the real machine, in `llec_building_gym/utils/heat_pump.py`. It was ported from the MATLAB model in `HEATPUMP/`:
+
+1. **Weather-compensated flow temperature** (`heating_curve`). This is the EN 442 radiator law. Flow is 55 °C at −10 °C outside and drops to a floor of 35 °C in mild weather.
+2. **2D COP = f(outdoor temp, flow temp)** (`HeatPump`). It interpolates the EN 14511 datasheet grid and includes duty-cycle averaging below the ≈4 kW modulation floor. Electrical power comes straight from the model.
+
+| Outdoor | Flow temp | COP at full load |
+|---|---|---|
+| −20 °C | 55.0 °C | 1.66 |
+| −7 °C | 52.3 °C | 2.16 |
+| 2 °C | 43.6 °C | 2.87 |
+| 10 °C | 35.0 °C | 4.98 |
+| 20 °C | 35.0 °C | 5.43 |
+
+Heating is therefore **about 3× cheaper per kWh of heat on a mild day than on a freezing one**. That matters for which controller wins (see §5). Enable the model with `--scop`. Cooling still uses a fixed `--cop_cool`, because the datasheet has no cooling data.
+
+### 2.3 Data (Langenhagen, full year 2025)
+
+| File | Content |
+|---|---|
+| `langenhagen-data/weather_langenhagen_2025.csv` | raw 15-min outdoor temperature |
+| `langenhagen-data/electricity_prices_2025.csv` | raw 15-min Tibber dynamic prices (EUR/kWh) |
+| `data/langenhagen_outdoor_temperature_5min.csv` | resampled to 5 min, 105,109 rows, −8.4 °C … 36.8 °C |
+| `data/langenhagen_price_2025.csv` | resampled to 5 min, 105,118 rows, −0.086 … 0.906 EUR/kWh (real negative prices included), plus a `price_normalized` column in [0, 1] |
+
+Days are split 80 % train / 20 % evaluation. Each episode picks a random day for weather and, independently, a random day for price.
+
+### 2.4 Reward
+
+```
+reward_step = exp(−|T_in − T_set|)                              # comfort, ∈ (0, 1]
+            − price · P_el / (max_price · P_el_worst_case)      # cost,    ∈ [−1, 0]
 ```
 
-### 2.1b Local (Windows):
+This is the `combined` reward mode, with both weights set to 1. `P_el` is the real electrical power from the COP model, so the cost term knows that mild-weather heating is cheap. An episode's score is the sum over 288 steps, so the best possible score is about 288 (perfect comfort, zero cost).
 
-Install Python 3.9.18 from https://www.python.org/downloads/release/python-3918 (newer Python versions may work but are not tested).
+---
+
+## 3. Controllers
+
+| Controller | Type | Notes |
+|---|---|---|
+| **SAC** | RL (off-policy) | trained on the real building, observation variant `C04` |
+| **PPO** | RL (on-policy) | trained on the real building, `C04` |
+| **MPC** | optimisation (Pyomo/IPOPT) | uses the real building parameters, horizon 12 steps (1 h). Its cost term is still COP-blind (see §6). |
+| **Fuzzy** | rule-based | reacts to temperature error |
+| **PI / PID** | feedback | gains are still tuned for the toy building |
+
+Observation variant `C04` = temperature deviation + current price + future prices + time of day + previous action.
+
+---
+
+## 4. Quick start
 
 ```bash
-git clone https://github.com/KIT-IAI/LLECBuildingGym
-py -3.9 -m venv llec_env
-.\llec_env\Scripts\activate
-cd LLECBuildingGym
-
-python -m pip install --upgrade --force-reinstall pip
+# install (Windows; use requirements.txt on Linux/HPC)
+python -m venv llec_env && .\llec_env\Scripts\activate
 pip install -r requirements_windows.txt
 pip install -e .
 ```
 
-
-### 2.2 Reinstallation (after code changes):
-
-```bash
-pip uninstall llec_building_gym -y
-pip install -e .
-```
-
-### 2.3 Environment Check (verify that the environment is registered correctly):
+> ⚠️ **The script defaults are still the toy building** (`mC=300, K=20, Q_HP_Max=1500, dt_scale=1e-3, COP=1`). To simulate our building, **always pass the real-building flags** below.
 
 ```bash
-python check_envs_registration.ipynb
+REAL="--mC 74600000 --K 366 --Q_HP_Max 12000 --cop_heat 2.2 --cop_cool 2.2 --scop --dt-scale 1.0"
 ```
 
-### 2.4 For using Jupyter notebooks:
-
+**Validate the building physics**
 ```bash
-source llec_env/bin/activate
-pip install ipykernel
-python -m ipykernel install --user --name=llec_env --display-name "Python (llec_env)"
-jupyter kernelspec list
+python validate_dynamics.py --mC 74600000 --K 366 --dt-scale 1.0 --hours 48
 ```
 
-Always activate the virtual environment (`source llec_env/bin/activate`) before starting Jupyter to ensure correct dependencies.
-After registering the kernel, restart Jupyter so the `Python (llec_env)` kernel becomes available.
+**Train** (SAC ≈ 2 h and PPO ≈ 1.5 h for 1M steps on a laptop GPU. Env stepping on the CPU is the bottleneck.)
+```bash
+python run_train_rl.py --algorithm sac --reward_mode combined --obs_variant C04 --training --seed 42 \
+  --timesteps 1e6 --num-envs 4 $REAL \
+  --outdoor-temperature-path data/langenhagen_outdoor_temperature_5min.csv \
+  --energy-price-path data/langenhagen_price_2025.csv \
+  --tensorboard-log tb_logs          # optional; view with: tensorboard --logdir tb_logs
+```
 
-</details>
+**Evaluate all controllers** (10 one-day episodes each)
+```bash
+python run_evaluation.py --algorithms sac ppo "PI Control" "PID Control" "Fuzzy Control" "MPC Control" \
+  --reward_mode combined --obs_variant C04 $REAL \
+  --outdoor_temperature_path data/langenhagen_outdoor_temperature_5min.csv \
+  --energy_price_path data/langenhagen_price_2025.csv --prefer_best
+```
 
-## 3.Training and Evaluation
-
-<details>
-  <summary>Click to expand/collapse</summary>
-
-This repository supports both RL agent training and controller evaluation via script-based workflows.
-RL training is handled using **[stable-baselines3](https://github.com/DLR-RM/stable-baselines3)** algorithms, while evaluation supports classical control strategies such as PI, PID, Fuzzy Logic, and MPC Controllers.
-
-### 3.1 RL Training:
-
-Train RL agents using the script **[run_train_rl.py](run_train_rl.py)**.
-
-Two reward modes and multiple observation variants are supported for flexible evaluations.
-
-- `temperature`: Temperature-based reward (single-objective)
-- `combined`: Temperature and energy cost combined (multi-objective)
-
-#### Command-line Arguments:
-
-| Argument              | Type  | Default Value                | Choices                                         | Description                                                  |
-| --------------------- | ----- | ---------------------------- | ----------------------------------------------- | ------------------------------------------------------------ |
-| `--algorithm`         | str   | `"ppo"`                      | `ppo`, `sac`, `ddpg`,`td3`, `a2c`               | RL algorithm to use (from Stable-Baselines3).                |
-| `--timesteps`         | float | `1e6`                        | Any positive float                              | Total number of environment steps.                           |
-| `--num-envs`          | int   | `4`                          | >= 1                                            | Number of parallel environments (for vectorized training).   |
-| `--seed`              | int   | `42`                         | Any integer                                     | Random seed for reproducibility.                             |
-| `--eval-freq`         | int   | `5000`                       | >= 1                                            | Evaluation frequency (in timesteps).                         |
-| `--reward_mode`       | str   | `"temperature"`              | `temperature`, `combined`                       | Reward mode: temperature (single-reward) or combined (multi-reward). |
-| `--energy-price-path` | str   | `"data/price_data_2025.csv"` | Valid CSV path                                  | Path to normalized energy price CSV file.                    |
-| `--training`          | flag  | `False`                      | `False`, `True`                                 | Use training data for energy prices (default: `TOU Prices`). |
-| `--obs_variant`       | str   | `T01`                        | `T01`,`T02`.`T03`,`T04`,`C01`,`C02`.`C03`,`C04` | Select observation variant (see detailed list below).        |
-
-#### Observation Variants:
-
-| Variant | Features Included                                       | Description                                |
-| ------- | ------------------------------------------------------- | ------------------------------------------ |
-| `T01`   | `noisy_temp_deviation`                                  | Temperature deviation only                 |
-| `T02`   | `noisy_temp_deviation`, `time_of_day`                   | Add normalized time of day                 |
-| `T03`   | `noisy_temp_deviation`, `prev_action`                   | Add previous normalized action             |
-| `T04`   | `noisy_temp_deviation`, `time_of_day`, `prev_action`    | Full thermal state                         |
-| `C01`   | `noisy_temp_deviation`, `energy_price`, `future_prices` | Thermal + current and future energy prices |
-| `C02`   | `C01` + `prev_action`                                   | C01 + previous action                      |
-| `C03`   | `C01` + `time_of_day`                                   | C01 + time of day                          |
-| `C04`   | `C01` + `time_of_day`, `prev_action`                    | Full combined state                        |
+**Summary table**
+```bash
+python compare_results.py --reward_mode combined --outdoor_temperature_path data/langenhagen_outdoor_temperature_5min.csv
+```
+Before re-running an evaluation, delete the old `results/combined/real_temp_data/*.csv`. Otherwise stale rows show up in the summary.
 
 ---
 
-#### Example Usage
+## 5. Results: how we got here
 
-```bash
-python run_train_rl.py --algorithm ppo --reward_mode temperature --training
-```
+Scores are **average reward per one-day episode** (higher is better). **Rounds are not comparable with each other**, because each round changed the physics or the data. Compare controllers only within a round.
 
-### 3.2 Evaluation:
+### Round 1: Original toy building (baseline)
+Repo defaults, temperature-only reward, observation `T01`.
 
-The evaluation supports both RL agents and advanced control strategies from control theory.  
-These include:
+| MPC | PID | PI | PPO | SAC | DDPG | Fuzzy | A2C |
+|---|---|---|---|---|---|---|---|
+| 267.26 | 251.14 | 251.14 | 250.99 | 250.30 | 230.45 | 214.96 | 142.49 |
 
-- **PI/PID Control** – widely used feedback controllers based on proportional, integral, and derivative action
-- **Fuzzy Control** – heuristic rule-based controller using fuzzy logic for handling uncertainty
-- **MPC Control** – model predictive control with configurable prediction horizon
+All controllers do well. It is an easy, fast-reacting toy building.
 
-#### Command-line Arguments:
+### Round 2: Real parameters, first attempt (superseded)
+We plugged in `mC/K/Q_HP_Max` and found that **MPC was optimising against the toy building internally**. It was never given the real parameters. After fixing that and retraining: SAC 4.96, PPO 4.57, MPC 1.72, PI/PID/Fuzzy ≈ −103.
+These numbers are **invalid**: they still used the `dt_scale = 1e-3` bug, which made the house react 1000× too slowly.
 
-| Argument        | Type | Default Value                                                                                       | Choices                                                | Description                                                                                                                                                                                       |
-| --------------- | ---- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--algorithms`  | list | `["ppo", "sac", "ddpg", "td3", "a2c", "PI Control", "PID Control", "Fuzzy Control", "MPC Control"]` | Any combination of supported controllers and RL models | List of algorithms or controllers to evaluate.                                                                                                                                                    |
-| `--episodes`    | int  | `10`                                                                                                | >= 1                                                   | Number of evaluation episodes per algorithm.                                                                                                                                                      |
-| `--seed`        | int  | `58`                                                                                                | Any integer                                            | Random seed for reproducibility.                                                                                                                                                                  |
-| `--model_seed`  | int  | `42`                                                                                                | Any integer                                            | Seed number used during training for selecting the correct model file.                                                                                                                                                                  |
-| `--mpc_horizon` | int  | `72`                                                                                                | >= 1 (typically multiples of 12)                       | Prediction horizon for MPC (in 5-minute steps, e.g., 12 = 1 hour).                                                                                                                               |
-| `--reward_mode` | str  | `"temperature"`                                                                                     | `temperature`, `combined`                              | Reward mode: temperature or combined (multi-objective).                                                                                                                                      |
-| `--energy_price_path` | str  | `"data/price_data_2025.csv"`                                                                  | `data/price_data_2025.csv`                             | Path to normalized energy price CSV.                                                                                                                                      |
-| `--outdoor_temperature_path` | str  | `"data/LLEC_outdoor_temperature_5min_data.csv"`                                        | `data/LLEC_outdoor_temperature_5min_data.csv`          | If not provided, a synthetic temperature profile is used.                                                                                                                                      |
-| `--obs_variant` | str  | `T01`                                                                                               | `T01`,`T02`.`T03`,`T04`,`C01`,`C02`.`C03`,`C04`        | Select observation variant (see detailed list below).                                                                                                                                             |
-| `--prefer_best` | flag | `False`                                                                                             | `False`,`True`                                         | If set, prefers loading `best_model.zip` instead of `<algorithm>_model_seed<seed>.zip` (e.g., `ppo_model_seed42.zip`) during evaluation. Supported algorithms: `ppo`, `sac`, `ddpg`,`td3`, `a2c`. |
+### Round 3: Correct physics (`dt_scale = 1.0`), 1D COP curve, KIT weather
+| MPC | PPO | SAC | Fuzzy | PI / PID |
+|---|---|---|---|---|
+| **50.26** | 43.10 | 36.11 | 34.27 | −27.85 |
+
+With correct physics, MPC led. The COP here was a 1D curve at a fixed 55 °C flow temperature (range 1.66–3.58).
+
+### Round 4 (current): Full 2D COP + real Langenhagen weather & prices
+SAC and PPO were retrained for 1M steps each (SAC 123 min, PPO 90 min), then all six controllers were evaluated on 10 held-out days.
+
+| Rank | Controller | Avg. reward | Eval time |
+|---|---|---|---|
+| 🥇 | **SAC** | **100.54** | 36 s |
+| 🥈 | MPC | 69.26 | 148 s |
+| 🥉 | PPO | 63.72 | 36 s |
+| 4 | Fuzzy | 62.94 | 24 s |
+| 5 | PI | −21.13 | 31 s |
+| 6 | PID | −21.14 | 32 s |
+
+**Why SAC now beats MPC.** We checked that this is a real effect and not a bug. Per-step reward breakdown:
+
+| | Comfort (norm.) | Cost (norm.) | Total per step | Mean \|action\| |
+|---|---|---|---|---|
+| MPC | 0.458 | −0.217 | 0.241 | 0.79 |
+| SAC | 0.432 | **−0.083** | **0.349** | 0.30 |
+
+MPC's internal cost model is `price × |action|`, so it is **blind to COP**. It doesn't know that heating on a mild day is about 3× cheaper than on a cold one. It heats hard all the time and buys slightly better comfort for about 2.6× the real energy cost. SAC was trained directly on the COP-aware reward and learned a much cheaper strategy that costs a little comfort. The effect grew in round 4 because the 2D COP varies far more (1.66–5.43) than the old 1D curve did.
+
+PI/PID remain negative because their gains were never retuned for a 56-hour time-constant house. They saturate and waste energy.
 
 ---
 
-#### Example Usage
+## 6. Where we are now
 
-```bash
-# Evaluate PPO agent for temperature based rewards
-python run_evaluation.py --algorithms ppo --reward_mode temperature --obs_variant T01
+**Done**
+- [x] Real building parameters exposed on the CLI and wired into the env **and** into MPC
+- [x] `dt_scale` physics bug fixed and validated (τ error 0.074 %)
+- [x] Full 2D datasheet heat pump model (IDM AERO ALM 4-12) with weather-compensated flow temperature
+- [x] Real Langenhagen 2025 weather + Tibber price data at 5-min resolution
+- [x] SAC/PPO retrained on the real building (`models/combined/C04/`)
+- [x] Full benchmark (round 4 above)
+- [x] TensorBoard logging for training
 
-# Evaluate all available agents and controllers
-chmod +x slurm_script/slurm_train_01_rl_batch.sh
-./slurm_script/slurm_train_01_rl_batch.sh
+**Open, roughly in priority order**
+1. **Make MPC's objective COP-aware.** Its cost is `price × |action|` instead of `price × P_el(COP)`. Until this is fixed, the MPC vs. SAC comparison favours SAC.
+2. **Retune PI/PID/Fuzzy gains** for the real building. They are currently not a fair baseline.
+3. **Coordinated weather/price sampling.** An episode currently pairs one day's weather with a different random day's prices.
+4. **Change the script defaults** to the real building so the flags aren't needed.
+5. `cop_cool` is still a fixed assumption (2.2). There is no cooling data for this heat pump.
+6. GPU utilisation is below 10 % during training because env stepping is the bottleneck. A `--gradient-steps` option would help.
+
+**Model caveats**
+
+| Path | Status |
+|---|---|
+| `models/combined/C04/{sac,ppo}_*` | ✅ current, trained on the real building (round 4) |
+| `models/combined/C04/{a2c,ddpg}_*`, `models/combined/C01–C03/`, `models/temperature/` | ⚠️ original toy-building models. Don't use them with the real-building flags. |
+
+A detailed, step-by-step log of every change is in **[CHANGELOG.md](CHANGELOG.md)**.
+
+---
+
+## 7. Repository layout
+
+```
+.
+├── llec_building_gym/
+│   ├── envs/base_building_gym.py   # Building (1R1C model) + BaseBuildingGym (Gymnasium env, reward)
+│   ├── controllers/                # PI, PID, Fuzzy, MPC (Pyomo) — see README_MPC.md for solver setup
+│   └── utils/
+│       ├── heat_pump.py            # IDM ALM 4-12 model: heating_curve + 2D COP HeatPump
+│       └── temporal_features.py
+├── HEATPUMP/                       # original MATLAB heat pump model (reference for heat_pump.py)
+├── data/                           # 5-min Langenhagen weather + price (used by the env)
+├── langenhagen-data/               # raw 15-min source data
+├── models/                         # trained RL models (see caveats above)
+├── results/                        # evaluation CSVs + logs (git-ignored, regenerate with run_evaluation.py)
+├── slurm_script/                   # batch scripts for HPC (SLURM) runs
+├── run_train_rl.py                 # train SAC / PPO / DDPG / A2C
+├── run_evaluation.py               # evaluate RL agents and classical controllers
+├── compare_results.py              # summary table from results/
+├── validate_dynamics.py            # free-response check of the building time constant
+└── CHANGELOG.md                    # full history of the retrofit
 ```
 
-The modular design allows users to plug in their own controllers or extend the environment with new features, e.g., building dynamics or pricing schemes.
+---
 
-</details>
+## Credits & license
 
-<h2>4. Citation &#128221;</h2>
-<p>
-If you use this framework in your research, please consider citing our paper &#128221; and giving the repository a star &#11088;:
-</p>
-
-```bibtex
-@inproceedings{demirel2025_LLECBuildingGym,
-  title     = {{Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings}},
-  author    = {Demirel, Gökhan and Ekin, Ömer and Liu, Jianlei and Spatafora, Luigi and Förderer, Kevin and Hagenmeyer, Veit},
-  year      = {2025},
-  booktitle = {2025 IEEE PES Innovative Smart Grid Technologies Conference Europe (ISGT Europe)},
-  pages     = {1--5},
-  doi       = {10.1109/ISGTEurope64741.2025.11305332},
-}
-```
-
-## License
-
-This code is licensed under the **[MIT License](LICENSE)**.
-For any issues or any intention of cooperation, please feel free to contact me at **[goekhan.demirel@kit.edu](goekhan.demirel@kit.edu)**.
-#   o p t i - h e a t - b u i l d i n g - g y m  
- 
+Based on [KIT-IAI/LLECBuildingGym](https://github.com/KIT-IAI/LLECBuildingGym) (G. Demirel, KIT IAI), the official code of the paper *"Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings"*.
+Licensed under the [MIT License](LICENSE).

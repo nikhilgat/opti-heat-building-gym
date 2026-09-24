@@ -1,6 +1,6 @@
 # Opti-Heat Building Gym
 
-Reinforcement-learning vs. classical control of a **real residential heat pump** — a single-family building in **Langenhagen (Hannover), Germany**, heated by an **IDM AERO ALM 4-12** air-source heat pump.
+Reinforcement-learning vs. classical control of a **real residential heat pump** — a multi-family building in **Langenhagen (Hannover), Germany**, heated by an **IDM AERO ALM 4-12** air-source heat pump.
 
 This project started as a fork of KIT's [LLECBuildingGym](https://github.com/KIT-IAI/LLECBuildingGym) (the code behind the paper *"Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings"*). That repo simulates a small *toy* building with a fixed-efficiency heat pump and weather from KIT Karlsruhe. We retrofitted it so the simulation describes **our** building: real thermal parameters, the real heat pump's datasheet, and a full year of real local weather and electricity prices. Then we retrained the RL agents and re-ran the whole controller benchmark.
 
@@ -254,10 +254,3 @@ A detailed, step-by-step log of every change is in **[CHANGELOG.md](CHANGELOG.md
 ├── validate_dynamics.py            # free-response check of the building time constant
 └── CHANGELOG.md                    # full history of the retrofit
 ```
-
----
-
-## Credits & license
-
-Based on [KIT-IAI/LLECBuildingGym](https://github.com/KIT-IAI/LLECBuildingGym) (G. Demirel, KIT IAI), the official code of the paper *"Advanced Deep Reinforcement Learning for Heat Pump Control in Residential Buildings"*.
-Licensed under the [MIT License](LICENSE).

@@ -43,6 +43,7 @@ class PIController:
         """
         error = obs[0]
         self.integral += error * self.dt
-        action = self.Kp * error + self.Ki * self.integral
+        # error = T_in - T_set; too warm -> negative action (positive action = heating)
+        action = -(self.Kp * error + self.Ki * self.integral)
         action = np.clip(action, -1.0, 1.0)
         return np.array([action]), None

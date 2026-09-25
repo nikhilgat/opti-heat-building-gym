@@ -57,6 +57,7 @@ class PIDController:
 
         self.prev_error = error
 
-        action = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+        # error = T_in - T_set; too warm -> negative action (positive action = heating)
+        action = -(self.Kp * error + self.Ki * self.integral + self.Kd * derivative)
         action = np.clip(action, -1.0, 1.0)
         return np.array([action]), None

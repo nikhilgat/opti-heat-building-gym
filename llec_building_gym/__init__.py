@@ -32,6 +32,17 @@ register(
     },
 )
 
+# Real-building hard rules: heating only, heating period Oct-Apr, comfort band 19-22 degC
+register(
+    id="LLEC-HeatPumpHouse-1R1C-Band-v0",
+    entry_point="llec_building_gym.envs:BaseBuildingGym",
+    max_episode_steps=288,
+    kwargs={
+        "reward_mode": "band",
+        "render_mode": None,
+    },
+)
+
 # Exported components of the llec_building_gym package
 __all__ = [
     "BaseBuildingGym",

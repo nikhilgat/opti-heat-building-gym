@@ -417,7 +417,7 @@ def main():
         "--obs_variant",
         type=str,
         default="T01",
-        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04"],
+        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05"],
         help=(
             "Select observation variant:\n"
             "  T01: [noisy_temp_deviation]                        – Temperature deviation only\n"

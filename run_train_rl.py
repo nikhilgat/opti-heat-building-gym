@@ -30,22 +30,26 @@ logger.debug("sys.argv: %s", sys.argv)
 
 # Helper classes & functions
 class SeedWrapper(gym.Wrapper):
-    """Ensures that env.reset() is called with a fixed seed unless
-    the user explicitly provides one (Gymnasium > 0.29 signature)."""
+    """Reproducible but different seed on every reset: seed, seed+10000, seed+20000, ...
+    (a fixed seed on every reset replays the exact same day/weather each episode)."""
 
     def __init__(self, env: gym.Env, seed: int):
         super().__init__(env)
         self._seed = seed
+        self._n_resets = 0
 
     def reset(self, *, seed=None, options=None):
-        return super().reset(seed=self._seed if seed is None else seed, options=options)
+        if seed is None:
+            seed = self._seed + 10_000 * self._n_resets
+        self._n_resets += 1
+        return super().reset(seed=seed, options=options)
 
 
-def make_env(env_id: str, rank: int, base_seed: int, **env_kwargs):
+def make_env(env_id: str, rank: int, base_seed: int, max_episode_steps: int = 288, **env_kwargs):
     """Factory function for SubprocVecEnv."""
 
     def _init() -> gym.Env:
-        env = gym.make(env_id, **env_kwargs)
+        env = gym.make(env_id, max_episode_steps=max_episode_steps, **env_kwargs)
         env = SeedWrapper(env, seed=base_seed + rank)
         return env
 
@@ -101,6 +105,8 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             batch_size=batch_size,
             buffer_size=buffer_size,
             learning_rate=learning_rate,
+            train_freq=1,  # SB3 default (1, "episode") only works with a single env
+            gradient_steps=1,
             device=device,
             tensorboard_log=tensorboard_log,
         )
@@ -115,6 +121,8 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             batch_size=batch_size,
             buffer_size=buffer_size,
             learning_rate=learning_rate,
+            train_freq=1,  # SB3 default (1, "episode") only works with a single env
+            gradient_steps=1,
             device=device,
             tensorboard_log=tensorboard_log,
         )
@@ -142,7 +150,12 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--algorithm", default="ppo", choices=["ppo", "sac", "ddpg", "a2c"]
+        "--algorithm", default="ppo", choices=["ppo", "sac", "ddpg", "td3", "a2c"]
+    )
+    parser.add_argument(
+        "--episode-days", type=int, default=7, dest="episode_days",
+        help="Episode length in days. Multi-day episodes make the agent live with a cold house "
+             "(the building's time constant is ~56 h, so one-day episodes let it coast).",
     )
     parser.add_argument("--timesteps", type=float, default=1e6)
     parser.add_argument(
@@ -151,7 +164,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-freq", type=int, default=20_000)
     parser.add_argument(
-        "--reward_mode", default="temperature", choices=["temperature", "combined"]
+        "--reward_mode", default="temperature", choices=["temperature", "combined", "band"],
+        help="band = real-building rules: heating only, Oct-Apr, comfort band 19-22 degC",
     )
     parser.add_argument("--energy-price-path", default="data/langenhagen_price_2025.csv")
     parser.add_argument(
@@ -162,7 +176,7 @@ def main():
     parser.add_argument(
         "--obs_variant",
         default="T01",
-        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04"],
+        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05"],
     )
     parser.add_argument("--mC", type=float, default=300, help="Thermal capacitance (J/K).")
     parser.add_argument("--K", type=float, default=20, help="Heat loss coefficient (W/K).")
@@ -215,6 +229,7 @@ def main():
     env_id = {
         "temperature": "LLEC-HeatPumpHouse-1R1C-Temperature-v0",
         "combined": "LLEC-HeatPumpHouse-1R1C-Combined-v0",
+        "band": "LLEC-HeatPumpHouse-1R1C-Band-v0",
     }[args.reward_mode]
 
     # Training environments setup
@@ -236,6 +251,8 @@ def main():
                 outdoor_temperature_path=args.outdoor_temperature_path,
                 dt_scale=args.dt_scale,
                 use_scop=args.scop,
+                simulation_time=args.episode_days * 24 * 3600,
+                max_episode_steps=args.episode_days * 288,
             )
             for i in range(args.num_envs)
         ]
@@ -262,6 +279,8 @@ def main():
                 outdoor_temperature_path=args.outdoor_temperature_path,
                 dt_scale=args.dt_scale,
                 use_scop=args.scop,
+                simulation_time=args.episode_days * 24 * 3600,
+                max_episode_steps=args.episode_days * 288,
             )
             for i in range(args.num_envs)
         ]

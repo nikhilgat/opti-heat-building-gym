@@ -119,9 +119,8 @@ class FuzzyController:
 
         Returns:
             (action, None): The first element is the control action in [-1, 1],
-                            consistent with the environment’s action space.
-                            Here, a negative sign is applied to invert fuzzy
-                            sign => environment’s sign convention.
+                            consistent with the environment’s action space
+                            (positive = heating).
         """
         error = obs[0]
         # Clip extreme errors to avoid undefined membership computations
@@ -153,6 +152,6 @@ class FuzzyController:
                 mu = self.membership(error, a, b, c)
                 print(f" {key}: membership={mu:.2f}, output={output}")
             print(f"  => action = {action:.2f}")
-        # Return the action as negative because we interpret
-        # positive membership as "cooling" in this example:
-        return np.clip(-np.array([action]), -1.0, 1.0), None
+        # Rule outputs already follow the environment's convention (cold -> +1 heating,
+        # hot -> -1), same as the extreme-error branches above.
+        return np.clip(np.array([action]), -1.0, 1.0), None

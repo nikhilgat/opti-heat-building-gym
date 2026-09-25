@@ -252,5 +252,125 @@ tensorboard --logdir tb_logs   # http://localhost:6006
 | **MPC's own economic objective ignores COP** | Confirmed to materially matter now (section 16) — this is the clear next fix if MPC should be compared fairly |
 | `cop_cool` | Still a fixed assumption (2.2) — no cooling data on the IDM ALM 4-12 datasheet, cooling isn't part of the 2D model |
 | "Fix all controllers to have the same base parameters" | Checked: PID/PI/Fuzzy hold no copy of `mC/K/Q_HP_Max` at all (pure reactive controllers on temp-deviation + hand-tuned gains) — nothing to desync, unlike MPC's earlier bug. The real gap for them is untuned gains, not parameter mismatch. |
-| Weather/price coordinated sampling (same real day for both) | Not done — see section 13 note |
-| Merge worktree branch into main checkout | Not done |
+| Weather/price coordinated sampling (same real day for both) | Done in section 22 |
+| Merge worktree branch into main checkout | Done (section 19) |
+
+## 19. Project restructure
+
+Worktree branch `real-building-scop-fix` (the up-to-date code) promoted to the single top-level project; old top-level copy, both `.git` dirs, `.claude/`, `__pycache__`, `setup.bat` (re-cloned upstream over the folder), empty slurm log dirs and the dead `plot-paper/` notebooks moved to `Documents/buildinggym_old_backup/`. Repo re-initialised by the user (`opti-heat-building-gym`). README shortened to building params, results, current state.
+
+## 20. 2026 test data + continuous inference
+
+Test data only — never used for training.
+
+| File | Content |
+|---|---|
+| `langenhagen-data/weather_langenhagen_2026.csv` | Open-Meteo hourly, 1 Jan – 31 Aug 2026, −9.9 … 37.8 °C (colder than any 2025 value) |
+| `langenhagen-data/electricity_prices_2026.csv` | Tibber 15-min, 1 Jan – 12 Sep 2026, trimmed to `Datum von, Datum bis, Tibber 2026` (full 30-column workbook export kept in `buildinggym_old_backup/`). **No prices 7 Jun – 6 Jul.** Range −0.385 … 0.906 EUR/kWh |
+
+New scripts:
+- `prepare_langenhagen_data.py --year 2026` — resamples to 5 min (temperature linear, prices step), normalises prices with the **2025 training** min/max, fills only gaps ≤ 75 min (DST hour), leaves missing days empty.
+- `run_inference.py --year 2026 --algorithm <algo> --model best|final` — walks every day from midnight in calendar order with the real weather + prices, indoor temperature carried over day to day (one continuous run), skips days without data (incl. 30 h price look-ahead), writes `results/inference/2026/<algo>_<model>_{live,summary}.png` + step/daily CSVs.
+
+## 21. Why the 2025 benchmark (sections 15–16) was misleading
+
+First 2026 run with the C04 SAC model: house drifted to 5–10 °C in winter (mean |T_in − T_set| 7.36 K). Root causes found:
+
+| Bug | Effect |
+|---|---|
+| `SeedWrapper` passed the **same seed on every reset** | every episode of a training env replayed the same day → C04 models trained on only **4 distinct days** |
+| **Heating/cooling sign reversed** in `update_Tin` (`T_in -= dT` with `+Q_HP` inside) and MPC's model | positive action cooled the house, while the 2D COP model charged positive actions as heating |
+| 1-day episodes starting at ~21 °C | with τ ≈ 56 h the house only loses ~4–5 K per day → "do nothing" scored well; all 10 eval episodes ended colder than they started, mean action ≈ 0 |
+| `np.random.seed(42)` inside `_load_energy_price` on every reset | "random" initial T_in always 21.0 |
+| "day" = `23*3600` s | price index drifted away from time of day |
+| weather window random, independent of price day | weather and price from different days |
+| DDPG/TD3 default `train_freq=(1,"episode")` | crash with >1 env |
+
+## 22. Fixes + new observation variant C05
+
+- `update_Tin`: `T_in += dt_scale·dt/mC·(−K(T_in−T_out) + Q_HP)`; MPC model same. +1 at 0 °C for 1 h: 20.00 → 20.22 °C.
+- `SeedWrapper`: seed + 10000·n on each reset (reproducible, different day each episode).
+- `--episode-days` (default 7) in `run_train_rl.py`; initial T_in uniform 16–23 °C (`self.np_random`).
+- 24 h days, episodes start at midnight; weather window = same calendar days as prices; multi-day episodes fit inside the data.
+- Local `RandomState(42)` for the train/eval day split (same split as before).
+- `C05` = C04 + outdoor temperature now and at +1/3/6/12/24 h.
+- DDPG/TD3: `train_freq=1, gradient_steps=1`; `td3` added to CLI.
+- `validate_dynamics.py` still PASS (0.074 %).
+
+## 23. Retraining (C05, 7-day episodes, 2025 data)
+
+All five in parallel, 1M steps, 4 envs each, `--tensorboard-log tb_logs` (TensorBoard at http://localhost:6006):
+
+| Algo | Time | Eval reward per 7-day episode: first / best (step) / last |
+|---|---|---|
+| SAC | 164.6 min | 443 / 876 (350k) / 735 |
+| TD3 | 141.3 min | 1015 / 1015 (50k) / 931 |
+| DDPG | 143.6 min | 690 / 777 (900k) / 173 |
+| PPO | 135.2 min | −93 / 558 (250k) / 424 |
+| A2C | 118.5 min | 399 / 399 (50k) / 323 |
+
+Eval is noisy (each eval = 5 different held-out weeks), so "best" can be an early lucky snapshot (TD3, A2C). Models in `models/combined/C05/`; old C04 models untouched.
+
+## 24. 2026 test results (1 Jan – 31 Aug, 211 days, continuous)
+
+| Model | Reward/day | Mean \|T_in−T_set\| | Within 1 K | kWh | EUR |
+|---|---|---|---|---|---|
+| **SAC best** | **102.8** | **1.47 K** | **57.9 %** | 9,495 | 3,215 |
+| SAC final | 82.7 | 1.60 K | 53.9 % | 11,808 | 4,006 |
+| TD3 final | 73.8 | 6.35 K | 45.2 % | 9,018 | 3,044 |
+| DDPG best | 69.9 | 3.61 K | 45.9 % | 9,774 | 3,264 |
+| PPO best | 57.6 | 4.76 K | 29.1 % | 2,748 | 920 |
+| A2C best | 57.6 | 2.05 K | 32.1 % | 4,986 | 1,708 |
+| old C04 SAC | 33.2 | 7.36 K | 18.9 % | 3,382 | 1,151 |
+
+SAC best holds ~18 °C all winter (old model: 5–10 °C). **But 38 % of its energy (3,627 kWh) is cooling**, and it heats even in Jul/Aug: the BA_RES setpoint alternates 21.7/18.3 °C and `exp(−|T_in−T_set|)` penalises too-warm like too-cold, so the agent heats to 21.7 then pays to cool to 18.3 daily. kWh/EUR above are therefore inflated.
+
+## 25. New hard rules from the building owner (to implement before next retraining)
+
+1. The heat pump **can only heat** — no cooling.
+2. Heating period **1 Oct – 30 Apr** only; the heat pump is off outside it regardless of temperatures.
+3. Comfort band **19–22 °C** (day 20–22, night down to 18; 19–22 chosen as one band).
+
+Clarified with the owner: 19 °C is never acceptable to undercut (overheating > 22 °C penalised the same), band 19–22 °C around the clock, train only on heating-period days and skip May–Sep in tests, no domestic hot water, classical controllers re-run under the same rules, retrain all five.
+
+Implemented as new reward mode `band` (env id `LLEC-HeatPumpHouse-1R1C-Band-v0`; `combined` untouched):
+- action space `[0, 1]`; negative actions and any action outside Oct–Apr forced to 0 (`Building.heating_allowed()`, mask from the price CSV timestamps)
+- train/eval start days only where the whole 7-day episode is inside Oct–Apr (2025: 161 train / 38 eval start days)
+- reward = energy cost (normalized, COP-aware) − 10 × K outside [19, 22] per step (1 K below costs ~30× the worst per-step energy cost); observation deviation measured from band centre 20.5 °C
+- PI/PID/Fuzzy were still tuned for the old reversed sign (would heat when too warm) → outputs negated / Fuzzy's normal path made consistent with its extreme branches
+- MPC `band` mode: LP (cbc) mirroring the reward — COP-aware cost `price·a·Pel_full(T_out)`, band slack penalty, heating only, 0 outside the heating period; 24 h horizon, re-planned hourly (0.6 s/solve); optional `--mpc-margin`
+- `run_inference.py`: `--reward_mode band` (default), classical controllers (`pi pid fuzzy mpc`), band metrics (time in band, K·h below/above), band shading in plots, outputs in `results/inference/2026/band/`
+
+Known simplification: thermal output is always `action × 12 kW`; the real IDM delivers ~9.6 kW at −10 °C, so the coldest days are easier in simulation than in reality.
+
+## 26. Band retraining + 2026 test under the hard rules
+
+Training (C05, 7-day episodes, 1M steps, Oct–Apr 2025): SAC 167 min, DDPG 144, TD3 142, PPO 136, A2C 119. Best eval per 7-day episode: A2C −195, SAC −202, TD3 −237, DDPG −239, PPO −292. Models in `models/band/C05/`.
+
+2026 test = 1 Jan – 30 Apr 2026 (120 days, continuous, real weather + Tibber prices). Sorted by cost:
+
+| Controller | In 19–22 °C | Below 19 °C | Mean T_in | kWh | EUR | Avg EUR/kWh paid |
+|---|---|---|---|---|---|---|
+| MPC | 84.7 % | 34.8 K·h | 19.73 | 4,499 | 1,392 | 0.309 |
+| **MPC, 0.3 K margin** | **100 %** | 0.06 K·h | 19.96 | 4,584 | **1,425** | **0.311** |
+| **Fuzzy** | **100 %** | 0 | 19.85 | 4,387 | **1,457** | 0.332 |
+| **A2C best** | **100 %** | 0 | 19.92 | 4,426 | **1,478** | 0.334 |
+| PPO best | 86.3 % | 299 K·h | 20.35 | 4,447 | 1,480 | 0.333 |
+| A2C final | 44.3 % | 520 K·h | 18.89 | 4,460 | 1,496 | 0.335 |
+| **SAC best** | **100 %** | 0 | 19.76 | 4,519 | **1,511** | 0.334 |
+| DDPG best | 99.9 % | 0.2 K·h | 19.86 | 4,681 | 1,549 | 0.331 |
+| PI / PID | 100 % | 0 | 20.50 | 4,665 | 1,552 | 0.333 |
+| DDPG final | 98.2 % | 2.9 K·h | 19.73 | 4,760 | 1,567 | 0.329 |
+| TD3 final | 100 % | 0 | 20.49 | 4,811 | 1,591 | 0.331 |
+| PPO final | 70.8 % | 1.8 K·h | 20.83 | 4,841 | 1,615 | 0.334 |
+| TD3 best | 100 % | 0 | 20.38 | 4,850 | 1,622 | 0.334 |
+| SAC final | 98.2 % | 0 | 21.13 | 4,940 | 1,660 | 0.336 |
+
+Findings:
+- Band-compliant spread is small: MPC+margin −8.2 % vs PI, Fuzzy −6.2 %, A2C best −4.8 %, SAC best −2.7 %.
+- RL agents learned the hard rules (A2C/SAC/TD3 best: 100 % in band) but **don't time heating to prices** (0.334 EUR/kWh, same as PI); their savings come only from sitting lower in the band. MPC pays 0.311 EUR/kWh by pre-heating the 56 h-time-constant house in cheap hours (it has perfect 24 h weather + price forecasts; RL's C05 also sees perfect forecasts).
+- Plain MPC sits exactly on 19.0 °C and the noisy temperature measurement pushes it below; a 0.3 K margin fixes it.
+- PPO and A2C final break the band; "best" snapshot is the better pick for A2C/SAC, "final" for TD3.
+- Comparison chart: `results/inference/2026/band/comparison.png` (+ `comparison.csv`).
+
+Next options: make RL exploit prices (e.g. higher `gamma` for the 56 h time constant, smaller band penalty scale relative to cost, longer training), or use MPC+margin as the controller; model heat pump capacity vs outdoor temperature.

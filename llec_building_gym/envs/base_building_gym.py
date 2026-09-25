@@ -114,9 +114,13 @@ class Building:
         outdoor_temperature_path=None,
         energy_price_path=None,
         dt_scale=1e-3,
+        heating_months=None,
     ):
         """
         Initialize the building model parameters and simulation constraints.
+        heating_months (tuple of int or None): if set, the heat pump may only run in
+        these calendar months (taken from the price CSV's `start` timestamps) and
+        episodes are only drawn from days fully inside them.
         Parameters:
             mC (float): Effective thermal mass (J/K). Defaults to 300.
             K (float): Heat transfer coefficient (W/K). Defaults to 20.
@@ -144,6 +148,8 @@ class Building:
         self.mC = mC
         self.K = K
         self.dt_scale = dt_scale
+        self.heating_months = heating_months
+        self.heating_mask = None  # per 5-min price row: heat pump allowed?
 
         # States
         self.iteration = 0
@@ -200,13 +206,11 @@ class Building:
             self._rng = np.random.default_rng(seed)
         else:
             self._rng = np.random.default_rng()
-        # Generate schedule with noise
-        self._create_schedule(add_noise=True, seed=seed)
         # Energy price preparation, if path given
         if self.energy_price_path is not None:
             self._load_energy_price()
-        # Select start index depending on training or test mode
-        steps_per_day = int(23 * 3600 // self.timestep)
+        # Select start index depending on training or test mode (episodes start at midnight)
+        steps_per_day = int(24 * 3600 // self.timestep)
         if self.energy_price_path is not None:
             if self.training:
                 day = self._rng.choice(self.train_days)
@@ -217,6 +221,8 @@ class Building:
                 self.start = day * steps_per_day
                 self.test_counter += 1
                 self.test_counter = self.test_counter % len(self.eval_days)
+        # Generate schedule with noise (a CSV weather file uses the same days as the prices)
+        self._create_schedule(add_noise=True, seed=seed)
         self._update_energy_price()
 
     def _generate_setpoint_profile(self, profile_type="BA_RES"):
@@ -368,7 +374,11 @@ class Building:
                     raise ValueError(
                         "Outdoor temperature data is shorter than simulation time."
                     )
-                start_idx = self._rng.integers(0, len(outdoor_values) - len(t) + 1)
+                if self.energy_price_path is not None and getattr(self, "start", None) is not None:
+                    # Same calendar window as the price data (both files start at the same midnight)
+                    start_idx = min(self.start, len(outdoor_values) - len(t))
+                else:
+                    start_idx = self._rng.integers(0, len(outdoor_values) - len(t) + 1)
                 T_deterministic = outdoor_values[start_idx : start_idx + len(t)]
                 # Check for NaNs and replace if necessary
                 if np.isnan(T_deterministic).any():
@@ -441,25 +451,42 @@ class Building:
         # Keep entire DataFrame
         self.full_price_df = price_df
 
-        steps_per_day = int(23 * 3600 // self.timestep)
+        steps_per_day = int(24 * 3600 // self.timestep)
         total_days = len(price_df) // steps_per_day
 
         # Generate a reproducible random split of days
         days = np.arange(total_days)
 
-        # Reproducible random split of training/evaluation days
-        # (sets the global NumPy random seed to ensure deterministic behavior)
-        np.random.seed(42)
-        np.random.shuffle(days)
+        # Reproducible random split of training/evaluation days. A local RNG gives the
+        # same permutation as the old np.random.seed(42) without resetting the global
+        # RNG on every reset (which made every "random" initial T_in identical).
+        np.random.RandomState(42).shuffle(days)
 
         num_train_days = int(self.train_ratio * total_days)
-        self.train_days = days[:num_train_days]
-        self.eval_days = days[num_train_days:]
+        # Multi-day episodes must fit inside the data
+        episode_days = int(np.ceil(self.simulation_time / (24 * 3600)))
+        last_start = total_days - episode_days
+        valid = np.arange(total_days) <= last_start
+        if self.heating_months is not None:
+            months = pd.to_datetime(price_df["start"]).dt.month.to_numpy()
+            self.heating_mask = np.isin(months, self.heating_months)
+            day_ok = self.heating_mask[: total_days * steps_per_day].reshape(total_days, steps_per_day).all(axis=1)
+            # every day of the episode must lie inside the heating period
+            for d in range(total_days):
+                valid[d] = valid[d] and day_ok[d:d + episode_days].all()
+        self.train_days = days[:num_train_days][valid[days[:num_train_days]]]
+        self.eval_days = days[num_train_days:][valid[days[num_train_days:]]]
         # Debug logging
         logger.debug(f"Loaded {total_days} days from energy price data.")
         logger.debug(
             f"Training days: {len(self.train_days)}, Evaluation days: {len(self.eval_days)}"
         )
+
+    def heating_allowed(self):
+        """True if the heat pump may run at the current step (heating period rule)."""
+        if self.heating_mask is None:
+            return True
+        return bool(self.heating_mask[min(self.start + self.iteration, len(self.heating_mask) - 1)])
 
     def _update_energy_price(self):
         """
@@ -512,12 +539,13 @@ class Building:
         # calibration; dt_scale=1.0 gives the physically correct dynamics
         # (thermal time constant mC/K, in seconds) when mC/K/Q_HP_Max are
         # true SI values.
+        # Heat loss to outside is subtracted, heat pump output added (positive action = heating).
         dT = (
             self.dt_scale
             * (self.timestep / self.mC)
-            * (self.K * (self.T_in - self.T_out[self.iteration]) + Q_HP)
+            * (-self.K * (self.T_in - self.T_out[self.iteration]) + Q_HP)
         )
-        self.T_in -= dT
+        self.T_in += dT
 
         # Move the simulation forward by one timestep
         self.iteration += 1
@@ -621,6 +649,14 @@ class BaseBuildingGym(gym.Env):
         # this heat pump's datasheet).
         self.use_scop = bool(kwargs.get("use_scop", False))
 
+        # "band" reward mode = the real building's hard rules: heating only, heat pump
+        # allowed only in the heating period (months), comfort band [T_low, T_high].
+        # No penalty inside the band; each K outside costs band_penalty per step
+        # (>> max normalized energy cost of 1 per step, so leaving the band is never worth it).
+        self.band = tuple(kwargs.get("comfort_band", (19.0, 22.0)))
+        self.band_penalty = float(kwargs.get("band_penalty", 10.0))
+        heating_months = kwargs.get("heating_months", (10, 11, 12, 1, 2, 3, 4)) if reward_mode == "band" else None
+
         self.obs_variant = kwargs.get("obs_variant", "T01")  # move up
         self.prediction_horizon = (
             12 * 5 * 6
@@ -639,7 +675,13 @@ class BaseBuildingGym(gym.Env):
             training=training,
             train_ratio=train_ratio,
             dt_scale=kwargs.get("dt_scale", 1e-3),
+            heating_months=heating_months,
         )
+        if reward_mode == "band":
+            # Observation's temperature deviation is measured from the band centre
+            mid = sum(self.band) / 2
+            self.building.T_set_profile = np.full_like(self.building.T_set_profile, mid, dtype=float)
+            self.building.T_set = mid
 
         # Worst-case electrical draw (W), used to normalize the economic
         # reward term to roughly [-1, 0] regardless of whether a fixed COP
@@ -670,8 +712,9 @@ class BaseBuildingGym(gym.Env):
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
-        # Action space in [-1, 1]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        # Action space in [-1, 1]; heating only in band mode
+        low = 0.0 if reward_mode == "band" else -1.0
+        self.action_space = spaces.Box(low=low, high=1.0, shape=(1,), dtype=np.float32)
 
         self.current_step = 0
         self.prev_action = 0
@@ -699,8 +742,9 @@ class BaseBuildingGym(gym.Env):
         if seed is None:
             seed = np.random.randint(0, 10000)  # global RNG
         super().reset(seed=seed, options=options)
-        # Randomize initial indoor temperature
-        initial_Tin = np.random.randint(low=20, high=40)  # global RNG
+        # Randomize initial indoor temperature around the comfort band (incl. below-setpoint
+        # starts, so the agent also learns to recover a cold house)
+        initial_Tin = self.np_random.uniform(16.0, 23.0)
         self.building.reset(T_in=initial_Tin, seed=seed)
         self.current_step = 0
         self.prev_action = 0
@@ -732,6 +776,12 @@ class BaseBuildingGym(gym.Env):
             truncated (bool): False in this environment.
             info (dict): Additional information data.
         """
+        if self.reward_mode == "band":
+            # Hard rules: heating only, and the heat pump is off outside the heating period
+            a = float(np.clip(action[0], 0.0, 1.0))
+            if not self.building.heating_allowed():
+                a = 0.0
+            action = np.array([a], dtype=np.float32)
         # Store the current action
         self.prev_action = action[0]
 
@@ -789,6 +839,11 @@ class BaseBuildingGym(gym.Env):
                 self.temperature_weight * reward_temperature_norm
                 + self.economic_weight * reward_economic_norm
             )
+        elif self.reward_mode == "band":
+            # No comfort penalty inside the band; band_penalty per K outside it
+            lo, hi = self.band
+            band_violation = max(0.0, lo - self.building.T_in) + max(0.0, self.building.T_in - hi)
+            reward = self.economic_weight * reward_economic_norm - self.band_penalty * band_violation
         else:
             raise ValueError(f"Invalid reward mode: {self.reward_mode}")
         logger.debug(
@@ -901,6 +956,7 @@ class BaseBuildingGym(gym.Env):
         - C02: [#1, #3, #4, #5] Adds energy use to C01.
         - C03: [#1, #2, #4, #5] Adds time of day to C01.
         - C04: [#1, #2, #3, #4, #5] Full feature set for temperature and economic control.
+        - C05: C04 + outdoor temperature now and at +1/3/6/12/24 h.
 
         Returns:
             np.ndarray: Observation vector of shape (n,), where n depends on `obs_variant`.
@@ -951,18 +1007,24 @@ class BaseBuildingGym(gym.Env):
                 normalized_time_of_day,
                 self.building.energy_price,
             ]
-        elif variant == "C04":
+        elif variant in ("C04", "C05"):
             observation = [
                 noisy_temp_deviation,
                 normalized_time_of_day,
                 normalized_prev_action,
                 self.building.energy_price,
             ]
+            if variant == "C05":
+                # Outdoor temperature now and forecast at +1/3/6/12/24 h, scaled ~[-2, 3]
+                T, i = self.building.T_out, self.building.iteration
+                observation += [
+                    (T[min(i + 12 * h, len(T) - 1)] - 10.0) / 10.0 for h in (0, 1, 3, 6, 12, 24)
+                ]
         else:
             raise ValueError(f"Unknown obs_variant: {variant}")
         # Future: add forecasted energy prices to observation
         # Append future prices if required
-        if variant in ("C01", "C02", "C03", "C04"):
+        if variant in ("C01", "C02", "C03", "C04", "C05"):
             observation.extend(self._get_future_energy_prices())
         return np.array(observation, dtype=np.float32)
 

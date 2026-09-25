@@ -35,6 +35,9 @@ class MPCController:
         action_reg=0.0,  # 0.01 in the published evaluation runs
         action_smoothing=0.0,  # 0.05 in the published evaluation runs
         dt_scale=1e-3,
+        band=(19.0, 22.0),
+        band_penalty=10.0,
+        p_el_worst_w=None,
     ):
         """
         Initialize the MPC parameters and the optimization preferences.
@@ -76,6 +79,11 @@ class MPCController:
         self.action_reg = float(action_reg)
         self.action_smoothing = float(action_smoothing)
         self.dt_scale = float(dt_scale)
+        # 'band' mode only: comfort band, penalty per K outside it, and the env's
+        # worst-case electrical draw (W) used to normalize the energy cost.
+        self.band = tuple(band)
+        self.band_penalty = float(band_penalty)
+        self.p_el_worst_w = float(p_el_worst_w) if p_el_worst_w else 1.0
 
         # Default building parameters if none are provided
         if building_params is None:
@@ -146,6 +154,12 @@ class MPCController:
         Q_HP_Max = self.building_params["Q_HP_Max"]
         dt = self.dt
 
+        if self.reward_mode == "band":
+            T_out_pred = list(kwargs["T_out_pred"])
+            T_out_list = (T_out_pred + [T_out_pred[-1]] * H)[:H]
+            heat_ok = (list(kwargs.get("heat_ok_pred", [True] * H)) + [False] * H)[:H]
+            return self._predict_band(T_in_current, T_out_list, price_list, heat_ok)
+
         # Safely retrieve T_out_pred
         T_out_pred = kwargs.get("T_out_pred", None)
         print(f"[DEBUG] Using T_set: {T_set_list}")
@@ -191,9 +205,9 @@ class MPCController:
                 return pyo.Constraint.Skip
             if i == H:
                 return pyo.Constraint.Skip
-            return m.T_in[i + 1] == m.T_in[i] - scale * (dt / mC) * (
-                K * (m.T_in[i] - T_out_list[i]) + m.action[i] * Q_HP_Max
-            )
+            return m.T_in[i + 1] == m.T_in[i] + scale * (dt / mC) * (
+                -K * (m.T_in[i] - T_out_list[i]) + m.action[i] * Q_HP_Max
+            )  # same physics as Building.update_Tin: positive action = heating
 
         model.dynamics = pyo.Constraint(model.t, rule=dyn_rule)
 
@@ -248,3 +262,52 @@ class MPCController:
         action_clipped = np.clip(action_first, -1.0, 1.0)
 
         return np.array([action_clipped]), None
+
+    def _predict_band(self, T_in_current, T_out_list, price_list, heat_ok):
+        """
+        'band' mode (real-building rules) as a linear program, mirroring the env reward:
+            min  sum_i  price_i * a_i * Pel_full_i / (price_max * p_el_worst_w)
+                      + band_penalty * (under_i + over_i)
+            s.t. 1R1C dynamics, 0 <= a_i <= 1 (heating only), a_i = 0 outside the
+                 heating period, under_i >= T_low - T_{i+1}, over_i >= T_{i+1} - T_high.
+        Pel_full_i = electrical power at full load from the IDM ALM 4-12 model at the
+        forecast outdoor temperature (COP-aware; part load assumed linear, which is
+        within ~5 % of the model's duty-cycling). The whole plan is kept in
+        self.last_plan so the caller can re-plan only every few steps.
+        """
+        from llec_building_gym.utils.heat_pump import heating_curve, HeatPump
+
+        if not hasattr(self, "_hp"):
+            self._hp = HeatPump()
+        H = self.horizon
+        mC, K, Q_HP_Max = (self.building_params[k] for k in ("mC", "K", "Q_HP_Max"))
+        lo, hi = self.band
+        pel_full = [
+            self._hp.get_performance(t, heating_curve(t)[0], 1.0)[1] * 1000.0 for t in T_out_list
+        ]
+        scale, dt = self.dt_scale, self.dt
+
+        m = pyo.ConcreteModel()
+        m.t = pyo.RangeSet(0, H - 1)
+        m.a = pyo.Var(m.t, bounds=(0.0, 1.0))
+        m.T = pyo.Var(range(H + 1))
+        m.under = pyo.Var(m.t, domain=pyo.NonNegativeReals)
+        m.over = pyo.Var(m.t, domain=pyo.NonNegativeReals)
+        m.T[0].fix(T_in_current)
+        for i in m.t:
+            if not heat_ok[i]:
+                m.a[i].fix(0.0)
+        m.dyn = pyo.Constraint(m.t, rule=lambda m, i: m.T[i + 1] == m.T[i] + scale * (dt / mC) * (
+            -K * (m.T[i] - T_out_list[i]) + m.a[i] * Q_HP_Max))
+        m.low = pyo.Constraint(m.t, rule=lambda m, i: m.under[i] >= lo - m.T[i + 1])
+        m.high = pyo.Constraint(m.t, rule=lambda m, i: m.over[i] >= m.T[i + 1] - hi)
+        m.obj = pyo.Objective(expr=sum(
+            self.economic_weight * price_list[i] * m.a[i] * pel_full[i] / (self.price_max * self.p_el_worst_w)
+            + self.band_penalty * (m.under[i] + m.over[i]) for i in m.t), sense=pyo.minimize)
+
+        solver = pyo.SolverFactory("cbc")
+        if not solver.available(exception_flag=False):
+            solver = pyo.SolverFactory("ipopt", executable=os.environ.get("IPOPT_EXECUTABLE", "ipopt"))
+        solver.solve(m, tee=False)
+        self.last_plan = np.clip([pyo.value(m.a[i]) for i in m.t], 0.0, 1.0)
+        return np.array([self.last_plan[0]]), None

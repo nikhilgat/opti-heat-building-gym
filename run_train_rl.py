@@ -11,7 +11,7 @@ import argparse
 import torch
 import gymnasium as gym
 from stable_baselines3 import PPO, SAC, DDPG, TD3, A2C
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 # from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
@@ -56,11 +56,12 @@ def make_env(env_id: str, rank: int, base_seed: int, max_episode_steps: int = 28
     return _init
 
 
-def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, buffer_size: int = 100_000, n_steps: int = 288, tensorboard_log: str = None):
+def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, buffer_size: int = 100_000, n_steps: int = 288, tensorboard_log: str = None, gamma: float = 0.99):
     """
     Selects and configures a model for training based on the algorithm name.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # small MLPs: on-policy PPO/A2C are faster on CPU (SB3 recommendation), off-policy on GPU
+    device = torch.device("cuda" if torch.cuda.is_available() and algorithm in ("sac", "ddpg", "td3") else "cpu")
     logger.info("Training on device: %s", device)
 
     # Hyperparameters for consistent evaluation across algorithms
@@ -76,6 +77,7 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             n_steps=n_steps,
             batch_size=batch_size,
             learning_rate=learning_rate,
+            gamma=gamma,
             device=device,
             tensorboard_log=tensorboard_log,
         )
@@ -90,6 +92,7 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             batch_size=batch_size,
             buffer_size=buffer_size,
             learning_rate=learning_rate,
+            gamma=gamma,
             device=device,
             use_sde=True,
             tensorboard_log=tensorboard_log,
@@ -105,6 +108,7 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             batch_size=batch_size,
             buffer_size=buffer_size,
             learning_rate=learning_rate,
+            gamma=gamma,
             train_freq=1,  # SB3 default (1, "episode") only works with a single env
             gradient_steps=1,
             device=device,
@@ -121,6 +125,7 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             batch_size=batch_size,
             buffer_size=buffer_size,
             learning_rate=learning_rate,
+            gamma=gamma,
             train_freq=1,  # SB3 default (1, "episode") only works with a single env
             gradient_steps=1,
             device=device,
@@ -135,6 +140,7 @@ def select_model(algorithm: str, env: gym.Env, seed: int, batch_size: int = 64, 
             seed=seed,
             n_steps=n_steps,
             learning_rate=learning_rate,
+            gamma=gamma,
             device=device,
             use_sde=True,
             tensorboard_log=tensorboard_log,
@@ -152,6 +158,25 @@ def main():
     parser.add_argument(
         "--algorithm", default="ppo", choices=["ppo", "sac", "ddpg", "td3", "a2c"]
     )
+    parser.add_argument("--vec-env", default="dummy", choices=["dummy", "subproc"], dest="vec_env",
+                        help="dummy = envs in the training process (fast env, no IPC); subproc = one process per env.")
+    parser.add_argument("--torch-threads", type=int, default=1, dest="torch_threads",
+                        help="CPU threads for PyTorch in this run (avoid oversubscription when running several runs).")
+    parser.add_argument("--economic-weight", type=float, default=1.0, dest="economic_weight",
+                        help="Weight of the energy-cost term in the reward (band penalty stays 10/K).")
+    parser.add_argument("--tag", default="", help="Suffix for the model/log folder, e.g. ew5 -> models/<mode>/<obs>_ew5/.")
+    parser.add_argument("--start-mode", default="random", choices=["random", "carry"], dest="start_mode",
+                        help="Training episode start temperature: random 16-23 degC, or carry = where the previous episode ended.")
+    parser.add_argument("--eval-T-in", type=float, default=20.5, dest="eval_T_in",
+                        help="Start temperature of every evaluation episode (fixed, so evaluations are comparable).")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount factor. ~0.998 (~40 h horizon) suits the building's ~56 h time constant.")
+    parser.add_argument("--backup-kw", type=float, default=0.0, dest="backup_kw",
+                        help="Electric backup heater (kW, COP 1) next to the heat pump (IDM AERO ALM 4-12: 6 kW).")
+    parser.add_argument("--forecast-error-path", default=None, dest="forecast_error_path",
+                        help="Real day-ahead weather forecast errors (prepare_langenhagen_data.py --forecast), used by C06.")
+    parser.add_argument("--eval-weeks", type=int, default=20, dest="eval_weeks",
+                        help="Fixed held-out episodes per evaluation (same ones every time); rounded to a multiple of --num-envs.")
     parser.add_argument(
         "--episode-days", type=int, default=7, dest="episode_days",
         help="Episode length in days. Multi-day episodes make the agent live with a cold house "
@@ -176,7 +201,7 @@ def main():
     parser.add_argument(
         "--obs_variant",
         default="T01",
-        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05"],
+        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05", "C06"],
     )
     parser.add_argument("--mC", type=float, default=300, help="Thermal capacitance (J/K).")
     parser.add_argument("--K", type=float, default=20, help="Heat loss coefficient (W/K).")
@@ -223,6 +248,9 @@ def main():
     args = parser.parse_args()
 
     args.timesteps = int(args.timesteps)
+    torch.set_num_threads(args.torch_threads)
+    sub = args.obs_variant + (f"_{args.tag}" if args.tag else "")
+    VecEnv = DummyVecEnv if args.vec_env == "dummy" else SubprocVecEnv
     logger.info("Parsed arguments: %s", vars(args))
 
     # Map usecase to environment Gym Environment ID alias per reward mode (registered by llec_building_gym)
@@ -233,7 +261,7 @@ def main():
     }[args.reward_mode]
 
     # Training environments setup
-    train_env = SubprocVecEnv(
+    train_env = VecEnv(
         [
             make_env(
                 env_id,
@@ -253,6 +281,10 @@ def main():
                 use_scop=args.scop,
                 simulation_time=args.episode_days * 24 * 3600,
                 max_episode_steps=args.episode_days * 288,
+                backup_kw=args.backup_kw,
+                economic_weight=args.economic_weight,
+                start_mode=args.start_mode,
+                forecast_error_path=args.forecast_error_path,
             )
             for i in range(args.num_envs)
         ]
@@ -260,13 +292,15 @@ def main():
     train_env = VecMonitor(train_env)
 
     # Evaluation environments setup
-    eval_env = SubprocVecEnv(
+    eval_env = VecEnv(
         [
             make_env(
                 env_id,
                 rank=i,
                 # ensure no overlap with training seeds
                 base_seed=args.seed + 10_000,
+                eval_subset=(i, args.num_envs, max(args.eval_weeks // args.num_envs, 1)),
+                fixed_T_in=args.eval_T_in,
                 energy_price_path=args.energy_price_path,
                 training=False,
                 schedule_type=None,
@@ -281,6 +315,9 @@ def main():
                 use_scop=args.scop,
                 simulation_time=args.episode_days * 24 * 3600,
                 max_episode_steps=args.episode_days * 288,
+                backup_kw=args.backup_kw,
+                economic_weight=args.economic_weight,
+                forecast_error_path=args.forecast_error_path,
             )
             for i in range(args.num_envs)
         ]
@@ -290,8 +327,10 @@ def main():
     # Evaluation callback setup
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=f"models/{args.reward_mode}/{args.obs_variant}/best_{args.algorithm}/",
+        # seed in the folder so several seeds of one algorithm don't overwrite each other's best model
+        best_model_save_path=f"models/{args.reward_mode}/{sub}/best_{args.algorithm}_seed{args.seed}/",
         eval_freq=max(args.eval_freq // args.num_envs, 1),
+        n_eval_episodes=args.num_envs * max(args.eval_weeks // args.num_envs, 1),
         deterministic=True,
         render=False,
     )
@@ -299,7 +338,7 @@ def main():
     model = select_model(
         args.algorithm, train_env, args.seed,
         batch_size=args.batch_size, buffer_size=args.buffer_size,
-        tensorboard_log=args.tensorboard_log,
+        tensorboard_log=args.tensorboard_log, gamma=args.gamma,
     )
     logger.info("Observation space: %s", train_env.observation_space)
     logger.info("Action space:      %s", train_env.action_space)
@@ -309,7 +348,7 @@ def main():
             args.tensorboard_log, args.tensorboard_log,
         )
     t0 = time.time()
-    tb_log_name = f"{args.algorithm}_{args.reward_mode}_{args.obs_variant}_seed{args.seed}"
+    tb_log_name = f"{args.algorithm}_{args.reward_mode}_{sub}_seed{args.seed}"
     model.learn(
         total_timesteps=args.timesteps, callback=eval_callback, progress_bar=True,
         tb_log_name=tb_log_name,
@@ -318,13 +357,13 @@ def main():
     logger.info("Training completed in %.2f min", (time.time() - t0) / 60)
 
     # Saving Model
-    save_dir = f"models/{args.reward_mode}/{args.obs_variant}"
+    save_dir = f"models/{args.reward_mode}/{sub}"
     os.makedirs(save_dir, exist_ok=True)
     save_path = f"{save_dir}/{args.algorithm}_model_seed{args.seed}"
     model.save(save_path)
     logger.info("Model saved to: %s", save_path)
     logger.info(
-        f"Best model path: models/{args.reward_mode}/{args.obs_variant}/best_{args.algorithm}/"
+        f"Best model path: models/{args.reward_mode}/{sub}/best_{args.algorithm}_seed{args.seed}/"
     )
 
     # Close environments

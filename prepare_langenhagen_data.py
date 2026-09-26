@@ -30,6 +30,9 @@ parser.add_argument("--raw-dir", default="langenhagen-data")
 parser.add_argument("--out-dir", default="data")
 parser.add_argument("--train-price", default="data/langenhagen_price_2025.csv",
                     help="Prepared training price CSV whose min/max defines the normalization.")
+parser.add_argument("--forecast", action="store_true",
+                    help="Also download the real day-ahead temperature forecast error (Open-Meteo previous runs, "
+                         "forecast issued 24 h before minus actual) -> data/langenhagen_forecast_error_5min_<year>.csv")
 args = parser.parse_args()
 
 
@@ -105,3 +108,19 @@ if os.path.exists(price_raw):
     report_gaps("prices", p)
 else:
     print(f"prices : {price_raw} not found, skipped (add it, then re-run)")
+
+if args.forecast:
+    import json
+    import urllib.request
+    w = read_weather(weather_raw)
+    end = min(w.index.max().date(), pd.Timestamp(f"{args.year}-12-31").date())
+    url = ("https://previous-runs-api.open-meteo.com/v1/forecast?latitude=52.44&longitude=9.74"
+           "&hourly=temperature_2m,temperature_2m_previous_day1&timezone=Europe%2FBerlin"
+           f"&start_date={args.year}-01-01&end_date={end}")
+    h = json.load(urllib.request.urlopen(url, timeout=120))["hourly"]
+    err = pd.Series(pd.Series(h["temperature_2m_previous_day1"]).values - pd.Series(h["temperature_2m"]).values,
+                    index=pd.to_datetime(h["time"]))
+    e = to_5min(err, "linear").fillna(0.0)
+    out = os.path.join(args.out_dir, f"langenhagen_forecast_error_5min_{args.year}.csv")
+    pd.DataFrame({"timestamp": e.index, "fc_err [K]": e.values.round(3)}).to_csv(out, index=False)
+    print(f"forecast error: {out}  {len(e)} rows, RMSE {(e ** 2).mean() ** 0.5:.2f} K, bias {e.mean():+.2f} K")

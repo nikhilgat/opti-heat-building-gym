@@ -41,6 +41,13 @@ models/band/C05/*
 !models/band/C05/best_sac/
 !models/band/C05/td3_model_seed42.zip
 
+# Realistic-forecast runs (C06, stages 1-3): keep only the RL models shown in docs/figures
+models/band/C06/*
+!models/band/C06/ppo_model_seed43.zip
+models/band/C06_ew5/
+models/band/C06_ew5carry/*
+!models/band/C06_ew5carry/best_td3_seed43/
+
 # Unused upstream folders
 notebooks_archive/
 imitation_learning/

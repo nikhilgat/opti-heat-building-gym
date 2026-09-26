@@ -374,3 +374,131 @@ Findings:
 - Comparison chart: `results/inference/2026/band/comparison.png` (+ `comparison.csv`).
 
 Next options: make RL exploit prices (e.g. higher `gamma` for the 56 h time constant, smaller band penalty scale relative to cost, longer training), or use MPC+margin as the controller; model heat pump capacity vs outdoor temperature.
+
+## 27. Realism + bug audit before the next training (C06)
+
+Research (Sept 2026):
+- **Prices:** EPEX day-ahead auction closes 12:00 CET, final results ~12:57; Tibber shows next-day prices from ~13:00. Before 13:00 only today's prices are known (11–24 h ahead), after 13:00 today + tomorrow (up to 35 h). The agents previously saw a perfect 30 h window at all times.
+- **Weather:** Open-Meteo "previous runs" archive has the forecasts actually issued 24 h earlier. Day-ahead error for Langenhagen 2025–26: RMSE 0.9 K, no bias, 95 % within ±1.9 K. The agents previously saw perfect forecasts.
+- **Backup heater:** IDM AERO ALM 4-12 indoor unit has a 6 kW "Sicherheitsheizstab"; the owner confirmed an electric backup heater that runs when the heat pump can't keep the house warm.
+- **Heating oil (baseline):** ~0.95 €/L in Jan 2026, ~1.42 €/L in Mar 2026 (Hormuz crisis); 9.97 kWh/L, 90 % boiler efficiency.
+
+Bugs found and fixed (each verified by a test):
+
+| Bug | Fix |
+|---|---|
+| Env always delivered `action × 12 kW` but charged the real IDM's electricity → heat pump 25 % too efficient at −10 °C (real unit: 9.6 kW) | action = share of the IDM's maximum output at the current outdoor temperature; heat and electricity both from the heat pump model |
+| Reward charged the **next** 5-min slot's price (15/15 slot changes) — MPC copied it | reward and MPC charge the current slot |
+| Sensor noise was `deviation × (1 + 10 %)` (zero noise at the setpoint) | additive 0.1 K |
+| 2025 **training** prices were linearly interpolated inside the last 5-min steps of each slot (44 % of steps changed vs 33 % for real 15-min prices; hourly until Oct 2025) | regenerated from the raw Tibber file as step prices (`data/langenhagen_price_2025.csv`, same normalization) |
+| `run_inference` reset "previous action" at every midnight | carried over (also backup heater state) |
+| 3 seeds of one algorithm would overwrite each other's `best_<algo>/` | `best_<algo>_seed<seed>/` (old folders still load) |
+| EvalCallback: 5 episodes, a different set every evaluation, 4 eval envs replaying the same days → noisy "best" model | 20 fixed held-out weeks (`--eval-weeks`), 5 distinct per eval env, identical every evaluation |
+| PI/Fuzzy tuned for the old reversed sign (fixed in §25) — Fuzzy at 19.5 °C target breaks the band | PI/PID target 19.5 °C (`--classical-target`), Fuzzy and heating curve keep the band centre 20.5 °C |
+
+New realism:
+- **`C06` observation** = C05 + real day-ahead weather forecast errors (`prepare_langenhagen_data.py --forecast` → `data/langenhagen_forecast_error_5min_<year>.csv`) + prices only as published (unpublished slots = same slot yesterday, `Building.price_forecast`) + share of the price look-ahead already published. C05 left unchanged so older models still load.
+- **Backup heater (6 kW, COP 1) is an automatic safety function, not a control input:** on when the room is below 19.0 °C, off at 19.2 °C, never outside the heating period. First version let controllers request it; MPC then used it for 457 kWh to fix 0.05 K dips (the band penalty of 10/K dwarfs its cost) — exactly the owner's concern, so it was taken out of the controllers' hands.
+- **MPC** plans the heat pump only (capacity at the forecast outdoor temperature), with the same forecasts as C06 and a soft 0.3 K buffer above 19 °C (penalty 1/K instead of 10/K) so noise is corrected with the heat pump, not the backup.
+- **Heating-curve baseline** (`run_inference.py --algorithm curve`): weather-compensated heat output from the outdoor sensor only, sized from K to hold 20.5 °C — the standard way a heat pump or oil boiler is run. Oil cost reported from the delivered heat.
+
+Classical baselines on the 2026 test (1 Jan – 30 Apr, 120 days, C06 information, real capacity, automatic backup):
+
+| Controller | In 19–22 °C | Below 19 °C | Backup | kWh | EUR |
+|---|---|---|---|---|---|
+| **MPC, 0.3 K soft margin** | 98.1 % (3.2 K·h above 22) | 0 | 0 kWh | 4,819 | **1,510** |
+| Fuzzy (20.5 °C) | 100 % | 0 | 41 kWh | 4,706 | 1,565 |
+| PI / PID (19.5 °C) | 100 % | 0 | 29 kWh | 4,700 | 1,568 |
+| Heating curve, heat pump | 100 % | 0 | 0 kWh | 4,954 | 1,658 |
+| Heating curve, **oil boiler** (1,808 L) | 100 % | 0 | — | — | **1,717–2,567** |
+| MPC, no margin | 96.3 % | 1.2 K·h | 1,860 kWh | 5,971 | 1,874 |
+
+With realistic forecasts MPC's edge shrinks to −9 % vs the heating curve (it was −8 % vs PI with perfect foresight). Riding the 19 °C edge now costs backup energy, so it no longer pays.
+
+Training speed-up (same results, less overhead): envs in the training process (`--vec-env dummy`), 1 PyTorch thread per run (`--torch-threads`), PPO/A2C on CPU, batch 256, max price cached in the env. Benchmark with 5 parallel runs: PPO 119 → 1,058 steps/s, DDPG/TD3 110 → ~370, SAC 97 → ~186.
+
+## 28. Stage 1 training (C06, all 5 algorithms × 3 seeds)
+
+Because each run now needs only one CPU thread, 3 seeds of every algorithm fit into the 15-thread budget at almost the same wall time as one seed — the cheapest way to get a reliable ranking. 15 runs: `--reward_mode band --obs_variant C06 --gamma 0.998 --backup-kw 6 --batch-size 256 --episode-days 7 --timesteps 1e6 --eval-weeks 20 --eval-freq 100000`, seeds 42/43/44, 2025 Oct–Apr data. Logs `results/train_logs/C06_<algo>_s<seed>.*.log`, TensorBoard `tb_logs/*_band_C06_*`, models `models/band/C06/`.
+
+Stage 1 finished overnight (A2C 63 min, PPO ~72, TD3 ~159, DDPG ~163, SAC ~210 min, all 15 without errors).
+
+**Eval curves are not trustworthy:** all 15 runs peak at the same evaluation (500k) and move in lockstep regardless of algorithm. Each eval week still started at a random 16–23 °C drawn from a seed sequence shared by all algorithms; starting below 19 °C costs hundreds in band penalties before the house can be heated, so "best" = the evaluation with lucky start temperatures.
+
+2026 test (1 Jan – 30 Apr, `run_inference.py`, all 30 models = 15 runs × best/final; `results/inference/2026/band/C06/comparison.{csv,png}`):
+
+| Controller | In band | Backup | EUR |
+|---|---|---|---|
+| MPC, 0.3 K soft margin | 98.2 % | 0 | **1,510** |
+| **best RL: PPO final, seed 43** | 100 % | 32 kWh | **1,541** |
+| Fuzzy / PI | 100 % | 29–41 kWh | 1,565–1,568 |
+| DDPG best s44 | 100 % | 26 kWh | 1,568 |
+| SAC final s43 | 100 % | 34 kWh | 1,595 |
+| heating curve (heat pump) | 100 % | 0 | 1,658 |
+| other RL models | 95–100 % | 0–1,491 kWh | 1,586 – 1,977 |
+| oil boiler | 100 % | — | 1,717 – 2,567 |
+
+Findings: RL keeps the rules (almost all ≥ 99 % in band) but no agent times heating to prices (all pay ~0.33 €/kWh like PI, MPC 0.31), many keep the house warmer than needed (mean 20–21 °C), and seeds differ a lot (PPO 1,541 – 1,786 €). Diagnosis: the economic signal is tiny — keeping the house 1 K warmer costs ~0.003 reward per step, while band penalties and random start temperatures swing returns by hundreds per week — so the agents learn "stay safely warm" and never see cost clearly.
+
+## 29. Stage 2: comparable evaluations + stronger cost signal (C06_ew5)
+
+Two changes, everything else as stage 1 (5 algorithms × seeds 42/43/44, 1M steps, gamma 0.998, 7-day episodes):
+- `--eval-T-in 20.5`: every evaluation episode starts at the band centre, so evaluation scores (and the saved "best" model) compare policies, not start temperatures.
+- `--economic-weight 5`: cost term ×5. A band violation still costs 10 per K per step — more than running the heat pump at full power at the most expensive price (normalized cost ≤ 1 × 5 × 4.95/10.95 ≈ 2.3 per step) — so staying in the band still always wins, but saving money is now visible.
+
+Models `models/band/C06_ew5/`, logs `results/train_logs/C06_ew5_*`, TensorBoard `*_band_C06_ew5_*`; test with `run_inference.py --tag ew5`.
+
+Stage 2 results (finished 10:38, 2026 test done 10:46; `results/inference/2026/band/C06_ew5/comparison.{csv,png}`):
+
+| | Stage 1 (C06) | Stage 2 (C06_ew5) |
+|---|---|---|
+| median of 30 RL models | 1,698 € | **1,649 €** (−3 %) |
+| best RL model | 1,541 € (PPO final s43) | 1,567 € (PPO best s42) |
+| models ≤ PI (1,568 €) | 2 | 1 |
+| median by algo SAC / PPO / DDPG / TD3 / A2C | 1,672 / 1,704 / 1,730 / 1,729 / 1,680 | 1,661 / **1,603** / 1,714 / **1,622** / 1,637 |
+| mean indoor temperature (median) | 20.09 °C | **19.69 °C** |
+| hours above 22 °C (all models) | 26 K·h | **0** |
+| backup heater (median) | 8 kWh | 70 kWh |
+| average price paid | 0.33 €/kWh | 0.33 €/kWh |
+
+The stronger cost signal works — agents keep the house cooler and stop overheating, PPO and TD3 improve most — but they now ride closer to 19 °C (more automatic backup use) and still don't time heating to cheap hours. Best RL remains at PI level, MPC (1,510 €) stays ahead.
+
+## 30. Stage 3: realistic start temperatures (C06_ew5carry) — queued automatically
+
+Owner's question: why do training weeks start at a random room temperature? A real house starts where the previous day left it. Until now each 7-day training episode (a random window of 2025) started at a uniform random 16–23 °C (original repo: 20–40 °C) — about 3 in 7 weeks started below 19 °C, giving unavoidable penalties that drown the cost signal and push agents to the warm side. (The 2026 test was never affected: it starts at 20 °C once and carries the temperature over day to day.)
+
+Fix: `--start-mode carry` — each training env continues from the temperature its previous episode ended at (first episode 20.5 °C), like a house in continuous operation; if the agent leaves the house cold at the end of a week it starts the next one cold. A heating-curve warm-up was considered but would almost always land at the curve's 20.5 °C target, i.e. effectively a fixed start. Evaluations stay at a fixed 20.5 °C.
+
+Stage 3 = stage 2 settings + `--start-mode carry`, 5 algorithms × seeds 42/43/44, tag `ew5carry`. Runs unattended via `results/train_logs/stage3_pipeline.py`: waits for stage 2 (training + 2026 tests) to finish, trains, tests all 30 models on 2026, writes `results/inference/2026/band/C06_ew5carry/comparison.{csv,png}`.
+
+TensorBoard cleaned: runs from before stage 2 moved to `Documents/buildinggym_old_backup/tb_logs_archive/`; `tb_logs/` only holds the current C06_ew5 / C06_ew5carry runs.
+
+Stage 3 results (training done 14:45, all 15 exit 0; 2026 test done 14:55; `results/inference/2026/band/C06_ew5carry/comparison.{csv,png}`):
+
+| | Stage 1 (C06) | Stage 2 (C06_ew5) | Stage 3 (C06_ew5carry) |
+|---|---|---|---|
+| best RL model | 1,541 € (PPO final s43) | 1,567 € (PPO best s42) | **1,538 € (TD3 best s43)** |
+| median of 30 RL models | 1,698 € | **1,649 €** | 1,674 € |
+| median by algo SAC / PPO / DDPG / TD3 / A2C | 1,672 / 1,704 / 1,730 / 1,729 / 1,680 | 1,661 / 1,603 / 1,714 / 1,622 / 1,637 | 1,739 / 1,685 / 1,681 / 1,666 / 1,662 |
+| backup heater (median) | 8 kWh | 70 kWh | 296 kWh |
+| mean indoor temperature (median) | 20.09 °C | 19.69 °C | 19.53 °C |
+| average price paid | 0.33 €/kWh | 0.33 €/kWh | 0.33 €/kWh |
+
+With realistic (carried-over) starts the agents run the house even closer to 19 °C, so the automatic backup heater (COP 1) kicks in more and eats the savings: the best single agent improves slightly, the median does not. With fixed-start evaluations the saved "best" snapshots are now meaningful — in stage 3 the 5 cheapest RL models are all "best" snapshots.
+
+## 31. Conclusion after three stages
+
+| Controller (2026 test, Jan–Apr) | Cost | vs heating curve |
+|---|---|---|
+| MPC, 0.3 K soft margin | 1,510 € | −9 % |
+| TD3 (stage 3, best s43) | 1,538 € | −7 % |
+| PPO (stage 1, final s43) | 1,541 € | −7 % |
+| Fuzzy / PI | 1,565 / 1,568 € | −6 / −5 % |
+| Heating curve (heat pump) | 1,658 € | — |
+| Oil boiler (same heat) | 1,717 – 2,567 € | +4 … +55 % |
+
+- RL reaches PI level at best; MPC stays ahead because it is the only controller that shifts heating into cheap hours (0.31 vs 0.33 €/kWh).
+- Seeds matter as much as algorithms (e.g. TD3 stage 3: 1,538 – 1,964 €); 3 seeds per algorithm were needed to see this.
+- A fourth stage with the same approach is not expected to help. Promising directions: penalize backup-heater energy explicitly (or add a small soft margin like MPC's), longer training / tuned hyperparameters for the best algorithms, or imitation of MPC as a starting point for RL.
+
+Docs: `docs/figures/stats_best_controllers.png` (cost + stats table), `mpc_margin0.3_summary.png`, `td3_rl_summary.png`; README rewritten with these results. `.gitignore` keeps only the two RL models shown (22 MB for `git add .`); all other C06 models (3 × 173 MB) stay local.

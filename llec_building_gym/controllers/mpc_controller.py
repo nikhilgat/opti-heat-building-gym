@@ -38,6 +38,8 @@ class MPCController:
         band=(19.0, 22.0),
         band_penalty=10.0,
         p_el_worst_w=None,
+        margin=0.0,
+        margin_penalty=1.0,
     ):
         """
         Initialize the MPC parameters and the optimization preferences.
@@ -84,6 +86,8 @@ class MPCController:
         self.band = tuple(band)
         self.band_penalty = float(band_penalty)
         self.p_el_worst_w = float(p_el_worst_w) if p_el_worst_w else 1.0
+        # soft buffer above the band's lower edge (K) and its penalty per K per step
+        self.margin, self.margin_penalty = float(margin), float(margin_penalty)
 
         # Default building parameters if none are provided
         if building_params is None:
@@ -266,13 +270,17 @@ class MPCController:
     def _predict_band(self, T_in_current, T_out_list, price_list, heat_ok):
         """
         'band' mode (real-building rules) as a linear program, mirroring the env reward:
-            min  sum_i  price_i * a_i * Pel_full_i / (price_max * p_el_worst_w)
-                      + band_penalty * (under_i + over_i)
-            s.t. 1R1C dynamics, 0 <= a_i <= 1 (heating only), a_i = 0 outside the
-                 heating period, under_i >= T_low - T_{i+1}, over_i >= T_{i+1} - T_high.
-        Pel_full_i = electrical power at full load from the IDM ALM 4-12 model at the
-        forecast outdoor temperature (COP-aware; part load assumed linear, which is
-        within ~5 % of the model's duty-cycling). The whole plan is kept in
+            min  sum_i  price_i * hp_i * Pel_full_i / Pth_max_i / (price_max * p_el_worst_w)
+                      + band_penalty * (under_i + over_i) + margin_penalty * soft_i
+            s.t. 1R1C dynamics with heat pump heat hp_i (W), 0 <= hp_i <= Pth_max_i (capacity
+                 at the forecast outdoor temperature), 0 outside the heating period,
+                 under_i >= T_low - T_{i+1}, over_i >= T_{i+1} - T_high,
+                 soft_i >= T_low + margin - T_{i+1}  (cheap buffer against noise / forecast error).
+        The electric backup heater is not planned: in the env it is an automatic safety function
+        below T_low, so the MPC plans with the heat pump alone.
+        Pth_max_i / Pel_full_i = IDM ALM 4-12 full-load heat / electrical power at the forecast
+        outdoor temperature (part load assumed linear, within ~5 % of the model's duty-cycling).
+        Actions are returned as the env expects: hp / Pth_max. The whole plan is kept in
         self.last_plan so the caller can re-plan only every few steps.
         """
         from llec_building_gym.utils.heat_pump import heating_curve, HeatPump
@@ -280,34 +288,38 @@ class MPCController:
         if not hasattr(self, "_hp"):
             self._hp = HeatPump()
         H = self.horizon
-        mC, K, Q_HP_Max = (self.building_params[k] for k in ("mC", "K", "Q_HP_Max"))
+        mC, K = self.building_params["mC"], self.building_params["K"]
         lo, hi = self.band
-        pel_full = [
-            self._hp.get_performance(t, heating_curve(t)[0], 1.0)[1] * 1000.0 for t in T_out_list
-        ]
+        full = [self._hp.get_performance(t, heating_curve(t)[0], 1.0) for t in T_out_list]
+        pth_max = [f[0] * 1000.0 for f in full]
+        el_per_heat = [f[1] / f[0] for f in full]  # W electrical per W heat at full load
         scale, dt = self.dt_scale, self.dt
 
         m = pyo.ConcreteModel()
         m.t = pyo.RangeSet(0, H - 1)
-        m.a = pyo.Var(m.t, bounds=(0.0, 1.0))
+        m.hp = pyo.Var(m.t, bounds=lambda m, i: (0.0, pth_max[i]))
         m.T = pyo.Var(range(H + 1))
         m.under = pyo.Var(m.t, domain=pyo.NonNegativeReals)
         m.over = pyo.Var(m.t, domain=pyo.NonNegativeReals)
+        m.soft = pyo.Var(m.t, domain=pyo.NonNegativeReals)
         m.T[0].fix(T_in_current)
         for i in m.t:
             if not heat_ok[i]:
-                m.a[i].fix(0.0)
+                m.hp[i].fix(0.0)
         m.dyn = pyo.Constraint(m.t, rule=lambda m, i: m.T[i + 1] == m.T[i] + scale * (dt / mC) * (
-            -K * (m.T[i] - T_out_list[i]) + m.a[i] * Q_HP_Max))
+            -K * (m.T[i] - T_out_list[i]) + m.hp[i]))
         m.low = pyo.Constraint(m.t, rule=lambda m, i: m.under[i] >= lo - m.T[i + 1])
         m.high = pyo.Constraint(m.t, rule=lambda m, i: m.over[i] >= m.T[i + 1] - hi)
+        m.buf = pyo.Constraint(m.t, rule=lambda m, i: m.soft[i] >= lo + self.margin - m.T[i + 1])
         m.obj = pyo.Objective(expr=sum(
-            self.economic_weight * price_list[i] * m.a[i] * pel_full[i] / (self.price_max * self.p_el_worst_w)
-            + self.band_penalty * (m.under[i] + m.over[i]) for i in m.t), sense=pyo.minimize)
+            self.economic_weight * price_list[i] * m.hp[i] * el_per_heat[i]
+            / (self.price_max * self.p_el_worst_w)
+            + self.band_penalty * (m.under[i] + m.over[i]) + self.margin_penalty * m.soft[i]
+            for i in m.t), sense=pyo.minimize)
 
         solver = pyo.SolverFactory("cbc")
         if not solver.available(exception_flag=False):
             solver = pyo.SolverFactory("ipopt", executable=os.environ.get("IPOPT_EXECUTABLE", "ipopt"))
         solver.solve(m, tee=False)
-        self.last_plan = np.clip([pyo.value(m.a[i]) for i in m.t], 0.0, 1.0)
+        self.last_plan = np.clip([pyo.value(m.hp[i]) / pth_max[i] for i in m.t], 0.0, 1.0)
         return np.array([self.last_plan[0]]), None

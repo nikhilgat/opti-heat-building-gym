@@ -57,7 +57,9 @@ def get_model_path(
         base_path = os.path.join(base_path, subfolder)
     # Select model seed
     standard_path = os.path.join(base_path, f"{algorithm}_model_seed{model_seed}.zip")
-    best_path = os.path.join(base_path, f"best_{algorithm}", "best_model.zip")
+    best_path = os.path.join(base_path, f"best_{algorithm}_seed{model_seed}", "best_model.zip")
+    if not os.path.exists(best_path):  # models trained before best folders carried the seed
+        best_path = os.path.join(base_path, f"best_{algorithm}", "best_model.zip")
 
     if prefer_best and os.path.exists(best_path):
         logger.info(f"Found best model for {algorithm}: {best_path}")
@@ -417,7 +419,7 @@ def main():
         "--obs_variant",
         type=str,
         default="T01",
-        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05"],
+        choices=["T01", "T02", "T03", "T04", "C01", "C02", "C03", "C04", "C05", "C06"],
         help=(
             "Select observation variant:\n"
             "  T01: [noisy_temp_deviation]                        – Temperature deviation only\n"

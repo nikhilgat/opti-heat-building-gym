@@ -1,56 +1,42 @@
 # Opti-Heat Building Gym
 
-RL vs. classical control of a real heat pump: a multi-family building in **Langenhagen (Hannover)** with an **IDM AERO ALM 4-12** air-source heat pump. The simulation runs in 5-min steps, and one episode is one day (288 steps).
+RL vs. classical control of a real heat pump: a multi-family building in **Langenhagen (Hannover)** with an **IDM AERO ALM 4-12** air-source heat pump and a 6 kW electric backup heater. 5-min control steps; trained on 2025, tested on Jan–Apr 2026.
 
-## Building parameters
+## Building and rules
 
-| Parameter | Value |
+| | |
 |---|---|
-| Thermal capacitance `mC` | 74,600,000 J/K |
-| Heat-loss coefficient `K` | 366 W/K |
-| Max heat output `Q_HP_Max` | 12,000 W |
-| Room setpoint | 20.2 °C |
-| Time constant `mC/K` | ≈ 56.6 h (validated: 0.074 % error) |
-| Heat pump COP | 2D datasheet model, from 1.66 (−20 °C) to 5.43 (+20 °C) |
-| Weather / prices | Langenhagen 2025 (5-min), Tibber dynamic prices |
+| Thermal capacitance `mC` / heat loss `K` | 74,600,000 J/K / 366 W/K (time constant ≈ 56.6 h, validated) |
+| Heat pump | IDM AERO ALM 4-12 datasheet model: output falls with outdoor temperature (9.6 kW at −10 °C), COP 1.66 (−20 °C) … 5.43 (+20 °C) |
+| Backup heater | 6 kW, COP 1, **automatic** safety function below 19 °C (not controllable) |
+| Rules | heating only, **1 Oct – 30 Apr**, comfort band **19–22 °C** |
+| Data | Langenhagen weather + Tibber 15-min prices; prices only as published (~13:00 for the next day), real day-ahead weather forecasts (±0.9 K) |
 
-⚠️ The script defaults are still the old toy building, so always pass:
+⚠️ Script defaults are still the old toy building. Training settings used (see `CHANGELOG.md` §27–30):
 ```
---mC 74600000 --K 366 --Q_HP_Max 12000 --cop_heat 2.2 --cop_cool 2.2 --scop --dt-scale 1.0
+--reward_mode band --obs_variant C06 --mC 74600000 --K 366 --Q_HP_Max 12000 --scop --dt-scale 1.0 --backup-kw 6
+--gamma 0.998 --economic-weight 5 --start-mode carry --episode-days 7
+--forecast-error-path data/langenhagen_forecast_error_5min_2025.csv
 ```
+Test: `python prepare_langenhagen_data.py --year 2026 --forecast` then `python run_inference.py --year 2026 --algorithm <sac|ppo|ddpg|td3|a2c|mpc|pi|fuzzy|curve>`.
 
-## Results
+## Results (2026 test, 1 Jan – 30 Apr, 120 days, continuous)
 
-Scores are the average reward per one-day episode (higher is better), with a combined comfort + cost reward and observation variant `C04`.
+![stats](docs/figures/stats_best_controllers.png)
 
-**Current run: 2D COP + real Langenhagen data**
+| Controller | Cost | vs heating curve |
+|---|---|---|
+| **MPC** (0.3 K soft margin) | **1,510 €** | −9 % |
+| TD3 (RL) | 1,538 € | −7 % |
+| PPO (RL) | 1,541 € | −7 % |
+| Fuzzy / PI | 1,565 – 1,568 € | −6 / −5 % |
+| Heating curve (standard heat pump control) | 1,658 € | — |
+| Oil boiler, same heat | 1,717 – 2,567 € (0.95 – 1.42 €/L) | +4 … +55 % |
 
-| Controller | Avg. reward |
-|---|---|
-| **SAC** | **100.54** |
-| MPC | 69.26 |
-| PPO | 63.72 |
-| Fuzzy | 62.94 |
-| PI | −21.13 |
-| PID | −21.14 |
-
-SAC beats MPC because MPC's cost model ignores COP. It heats harder (mean |action| 0.79 vs 0.30) and pays about 2.6× the energy cost for only slightly better comfort.
-
-**Earlier runs** (different physics and data, so not comparable with the current run):
-
-| Run | MPC | PPO | SAC | Fuzzy | PI/PID |
-|---|---|---|---|---|---|
-| Toy building (repo defaults) | 267.26 | 250.99 | 250.30 | 214.96 | 251.14 |
-| Real params, 1D COP, KIT weather | 50.26 | 43.10 | 36.11 | 34.27 | −27.85 |
+All controllers keep 19–22 °C ≥ 98 % of the time. Daily plots: [MPC](docs/figures/mpc_margin0.3_summary.png), [TD3](docs/figures/td3_rl_summary.png).
 
 ## Current state
 
-**Done:** real building parameters, a validated thermal model, the 2D heat pump model, real Langenhagen data, and SAC/PPO retrained on this building (`models/combined/C04/`).
-
-**Open:**
-1. Make MPC's cost model use COP, so the comparison with SAC is fair.
-2. Retune the PI/PID/Fuzzy gains for this building.
-3. Sample weather and price from the same day in each episode.
-4. Change the script defaults to this building.
-
-Only the `C04` SAC/PPO models are current. Every other model in `models/` is from the old toy building. The full change history is in [CHANGELOG.md](CHANGELOG.md).
+- Three training stages (5 algorithms × 3 seeds each) done. The best RL agents reach PI level and beat the heating curve and oil, but **MPC is still the best controller**.
+- RL agents learned the rules and to run the house cooler, but **not to shift heating into cheap hours** (they pay ~0.33 €/kWh, MPC 0.31). With realistic starts they ride close to 19 °C and trigger the backup heater more.
+- Models in the repo: `models/band/C06_ew5carry/best_td3_seed43/` (TD3), `models/band/C06/ppo_model_seed43.zip` (PPO). Full history and all numbers: [CHANGELOG.md](CHANGELOG.md).
